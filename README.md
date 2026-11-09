@@ -3,6 +3,8 @@
 A standalone two-deck DJ application in Rust. It is developed on macOS/Linux with a
 Roland DJ-505 and targets a Raspberry Pi CM5 with a 7″ touchscreen.
 
+![Two decks playing: full-width scrolling waveforms with beatgrids and transient markers, deck panels either side of the mixer, and the library browser below](demo.png)
+
 ## Status
 
 - **Milestone 0 (skeleton):** done. Workspace, CI, a window, and a sine tone through

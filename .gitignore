@@ -1,8 +1,52 @@
+# Rust build output
 /target
 **/*.rs.bk
-.DS_Store
-# Large local audio for manual testing. Generated test data in test-data/ is committed.
+*.pdb
+
+# Profiling and debugging leftovers
+perf.data*
+flamegraph*.svg
+*.profraw
+core
+core.*
+
+# Large local audio for manual testing. The small generated fixtures in test-data/
+# are committed; anything else in there is not.
 /music/
+/test-data/*
+!/test-data/README.md
+!/test-data/tone-*
+
+# Analysis sidecars written next to tracks (tools/analyze)
+*.dj.json
+*.dj.json.tmp
+
+# Local library databases and screenshots from --screenshot runs
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/*.png
+!/demo.png
+
+# Python (tools/analyze)
+.venv/
 __pycache__/
 *.pyc
-.venv/
+.pytest_cache/
+*.egg-info/
+
+# Secrets and local config
+.env
+.env.*
+*.pem
+*.key
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
