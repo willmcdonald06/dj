@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.DS_Store
+# Large local audio for manual testing. Generated test data in test-data/ is committed.
+/music/
+__pycache__/
+*.pyc
+.venv/

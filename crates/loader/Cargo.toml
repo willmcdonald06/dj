@@ -1,0 +1,19 @@
+[package]
+name = "dj-loader"
+description = "Track loading: decoding (symphonia), resampling (rubato) and the loader thread."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dj-engine.workspace = true
+dj-analysis.workspace = true
+rubato.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

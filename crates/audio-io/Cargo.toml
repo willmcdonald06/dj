@@ -1,0 +1,20 @@
+[package]
+name = "dj-audio-io"
+description = "cpal audio backend: device selection, stream setup, channel routing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dj-engine.workspace = true
+cpal.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# In debug builds, aborts if the audio callback allocates; compiles to nothing in release.
+assert_no_alloc.workspace = true
+
+[lints]
+workspace = true

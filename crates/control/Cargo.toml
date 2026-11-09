@@ -1,0 +1,20 @@
+[package]
+name = "dj-control"
+description = "Controller input/output: MIDI, mappings (DJ-505 first), later the custom control surface."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dj-engine.workspace = true
+midir.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+midir.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+# Install into tools/analyze/.venv; see README.md. CPU builds of torch keep the download
+# small (~200 MB) and avoid needing a matching CUDA setup.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.*
+torchaudio==2.11.*
+beat_this==1.1.*
+librosa==1.0.*

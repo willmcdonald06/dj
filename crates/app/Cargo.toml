@@ -1,0 +1,29 @@
+[package]
+name = "dj-app"
+description = "The DJ application binary: wires engine, audio, control and UI together."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "dj"
+path = "src/main.rs"
+
+[dependencies]
+dj-engine.workspace = true
+dj-audio-io.workspace = true
+dj-control.workspace = true
+dj-ui.workspace = true
+dj-loader.workspace = true
+dj-analysis.workspace = true
+dj-library.workspace = true
+png.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+assert_no_alloc.workspace = true
+
+[lints]
+workspace = true

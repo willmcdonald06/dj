@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+dj-engine = { path = "crates/engine" }
+dj-audio-io = { path = "crates/audio-io" }
+dj-control = { path = "crates/control" }
+dj-library = { path = "crates/library" }
+dj-analysis = { path = "crates/analysis" }
+dj-ui = { path = "crates/ui" }
+dj-loader = { path = "crates/loader" }
+dj-stretch = { path = "crates/stretch" }
+
+# External
+anyhow = "1"
+assert_no_alloc = "1.1"
+bytemuck = "1"
+cpal = { version = "0.18", features = ["realtime"] }
+midir = "0.11"
+pollster = "1"
+rtrb = "0.4"
+rubato = "5"
+realfft = "3.5"
+symphonia = { version = "0.6", default-features = false, features = ["opt-simd", "all-meta", "flac", "mp3", "aac", "isomp4", "pcm", "wav", "aiff", "ogg", "vorbis"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+triple_buffer = "9"
+wgpu = "30"
+winit = "0.30"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }
+glyphon = "0.12"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Style rule: no one-line `let x = if a { b } else { c };`. Clippy has no lint for
+# this exactly; it is enforced in review and by `tools/check-style.sh`.
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.release]
+debug = 1
+lto = "thin"
+
+# Keep DSP code fast even in dev builds so audio doesn't glitch while iterating.
+[profile.dev.package.dj-engine]
+opt-level = 2
+
+[profile.dev.package.dj-loader]
+opt-level = 2
+
+[profile.dev.package.dj-analysis]
+opt-level = 2
+
+[profile.dev.package.dj-stretch]
+opt-level = 2
+
+# Optimise all dependencies in dev builds too: unoptimised symphonia and rubato decode
+# far slower than real time would allow for, and wgpu is sluggish.
+[profile.dev.package."*"]
+opt-level = 2
