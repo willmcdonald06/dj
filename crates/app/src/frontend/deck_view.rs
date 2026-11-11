@@ -3,7 +3,8 @@
 
 use dj_analysis::{Key as MusicalKey, KeyNotation, TrackAnalysis};
 use dj_engine::{
-    DeckAction, DeckId, DeckSnapshot, HotCue, STEM_COUNT, Stem, TempoRange, Transport,
+    DeckAction, DeckId, DeckSnapshot, HotCue, SAMPLER_SLOTS, STEM_COUNT, SampleMode,
+    SamplerSnapshot, Stem, TempoRange, Transport,
 };
 use dj_loader::TrackInfo;
 use dj_ui::{Align, Rect, WaveformStyle};
@@ -43,6 +44,8 @@ pub struct DeckView<'a> {
     /// Length of the next auto loop, in beats.
     pub loop_beats: f32,
     pub style: WaveformStyle,
+    pub sampler: &'a SamplerSnapshot,
+    pub sample_names: &'a [Option<String>; SAMPLER_SLOTS],
 }
 
 impl Painter {
@@ -294,7 +297,24 @@ impl Painter {
                 UiAction::Deck(deck, DeckAction::LoopOut),
             );
         }
-        let (reloop, rest) = rest.split_right(self.px(70.0), gap);
+        // Reverse and slip mode, at the far right.
+        let (reverse, rest) = rest.split_right(self.px(44.0), gap);
+        self.button(
+            reverse,
+            "REV",
+            d.reverse,
+            WARNING,
+            UiAction::Deck(deck, DeckAction::ToggleReverse),
+        );
+        let (slip, rest) = rest.split_right(self.px(44.0), gap);
+        self.button(
+            slip,
+            "SLIP",
+            d.slip_mode,
+            FILTER,
+            UiAction::Deck(deck, DeckAction::ToggleSlipMode),
+        );
+        let (reloop, rest) = rest.split_right(self.px(64.0), gap);
         self.button(
             reloop,
             "RELOOP",
@@ -339,10 +359,12 @@ impl Painter {
             ("JUMP", PadMode::Jump),
             ("GRID", PadMode::Grid),
             ("STEMS", PadMode::Stems),
+            ("SAMPLER", PadMode::Sampler),
         ];
-        let tab_w = self.px(52.0);
         let mut x = area.x;
         for (label, mode) in modes {
+            // As wide as the label, plus a gap.
+            let tab_w = self.px(label.len() as f32 * 6.2 + 11.0);
             let tab = Area::new(x, area.y, tab_w, area.height);
             let active = v.pads.mode == mode;
             let ink = match active {
@@ -361,6 +383,10 @@ impl Painter {
             x += tab_w;
         }
         let mut right = area;
+        if v.pads.mode == PadMode::Sampler {
+            self.sampler_controls(v, area, x);
+            return;
+        }
         if v.pads.mode == PadMode::HotCue {
             let (delete, rest) = area.split_right(self.px(64.0), self.px(8.0));
             right = rest;
@@ -377,6 +403,113 @@ impl Painter {
             );
         }
         self.stem_chips(v, right, x);
+    }
+
+    /// Sampler pad `i`: the sample's name and play mode, lit while it plays, with a
+    /// line showing how far through it is. Empty pads say LOAD.
+    fn sampler_pad(&mut self, v: &DeckView<'_>, pad: Area, i: usize) {
+        let slot = v.sampler.slots[i];
+        let action = UiAction::SamplerPad(v.deck, i);
+        let Some(name) = v.sample_names[i]
+            .as_deref()
+            .filter(|_| slot.sample.is_some())
+        else {
+            self.tinted_button(pad, "", false, DIM_TEXT, action);
+            let caption = Area::new(
+                pad.x,
+                pad.bottom() - self.px(15.0),
+                pad.width,
+                self.px(11.0),
+            );
+            self.label(caption, "LOAD", 7.0, DIM_TEXT, Align::Center);
+            return;
+        };
+        let color = match slot.mode {
+            SampleMode::OneShot => CUE,
+            SampleMode::Gated => FILTER,
+            SampleMode::Loop => LOOP,
+        };
+        let lit = slot.playing || slot.waiting;
+        // The tinted button draws the body; the name goes on top, smaller, so more of it
+        // fits.
+        self.tinted_button(pad, "", lit, color, action);
+        let ink = match lit {
+            true => ink_on(color),
+            false => color,
+        };
+        let short: String = name.chars().take(8).collect();
+        let name_area = Area::new(pad.x, pad.y, pad.width, pad.height - self.px(12.0));
+        self.bold(
+            name_area.inset_x(self.px(3.0)),
+            short,
+            8.5,
+            ink,
+            Align::Center,
+        );
+        let caption = Area::new(
+            pad.x,
+            pad.bottom() - self.px(15.0),
+            pad.width,
+            self.px(11.0),
+        );
+        let soft = match lit {
+            true => ink,
+            false => SOFT_TEXT,
+        };
+        let mode = match slot.waiting {
+            true => "WAIT",
+            false => slot.mode.label(),
+        };
+        self.label(caption, mode, 7.0, soft, Align::Center);
+        if slot.playing {
+            let w = (pad.width - self.px(6.0)) * slot.progress.clamp(0.0, 1.0);
+            self.fill(
+                Area::new(
+                    pad.x + self.px(3.0),
+                    pad.bottom() - self.px(3.0),
+                    w,
+                    self.px(2.0),
+                ),
+                ink,
+            );
+        }
+    }
+
+    /// In SAMPLER mode, at the right of the tabs: the level, SYNC, MODE and DELETE.
+    fn sampler_controls(&mut self, v: &DeckView<'_>, area: Area, min_x: f32) {
+        let gap = self.px(4.0);
+        let needed = self.px(48.0 + 42.0 + 36.0 + 18.0) + gap * 3.0;
+        if area.right() - needed < min_x {
+            return;
+        }
+        let (delete, rest) = area.split_right(self.px(48.0), gap);
+        let label = match v.pads.delete_armed {
+            true => "PAD?",
+            false => "DELETE",
+        };
+        self.tinted_button(
+            delete,
+            label,
+            v.pads.delete_armed,
+            DANGER,
+            UiAction::DeleteArm(v.deck),
+        );
+        let (mode, rest) = rest.split_right(self.px(42.0), gap);
+        let label = match v.pads.mode_armed {
+            true => "PAD?",
+            false => "MODE",
+        };
+        self.tinted_button(
+            mode,
+            label,
+            v.pads.mode_armed,
+            CUE,
+            UiAction::SamplerModeArm(v.deck),
+        );
+        let (sync, rest) = rest.split_right(self.px(36.0), gap);
+        self.button(sync, "SYNC", v.sampler.sync, PLAY, UiAction::SamplerSync);
+        let (level, _) = rest.split_right(self.px(18.0), 0.0);
+        self.small_knob(level, v.sampler.level, TEXT, Slider::SamplerLevel);
     }
 
     /// One small chip per stem at the right of `area` (left of `min_x` is taken):
@@ -430,7 +563,7 @@ impl Painter {
                 }
                 PadMode::Roll => {
                     let (label, beats) = ROLL_PADS[i];
-                    let on = d.slip_position.is_some()
+                    let on = d.rolling
                         && d.loop_region.is_some_and(|r| {
                             d.grid.is_some_and(|g| {
                                 ((r.len() / g.period) as f32 - beats).abs() < 0.001
@@ -456,6 +589,7 @@ impl Painter {
                     };
                     self.tinted_button(pad, label, false, color, UiAction::Grid(deck, edit));
                 }
+                PadMode::Sampler => self.sampler_pad(v, pad, i),
                 PadMode::Stems => {
                     let stems = d.stems;
                     let stem = Stem::ALL[i % STEM_COUNT];

@@ -18,10 +18,11 @@ pub enum SettingRow {
     KeyLock,
     KeyNotation,
     Waveform,
+    Midi,
 }
 
 impl SettingRow {
-    pub const ALL: [SettingRow; 7] = [
+    pub const ALL: [SettingRow; 8] = [
         SettingRow::Device,
         SettingRow::Buffer,
         SettingRow::Output,
@@ -29,6 +30,7 @@ impl SettingRow {
         SettingRow::KeyLock,
         SettingRow::KeyNotation,
         SettingRow::Waveform,
+        SettingRow::Midi,
     ];
 
     fn label(self) -> &'static str {
@@ -40,6 +42,7 @@ impl SettingRow {
             SettingRow::KeyLock => "Key lock at start",
             SettingRow::KeyNotation => "Key notation",
             SettingRow::Waveform => "Waveform colours",
+            SettingRow::Midi => "MIDI controller",
         }
     }
 
@@ -49,6 +52,7 @@ impl SettingRow {
             SettingRow::Device | SettingRow::Buffer | SettingRow::Output => "AUDIO",
             SettingRow::TempoRange | SettingRow::KeyLock => "DECKS",
             SettingRow::KeyNotation | SettingRow::Waveform => "DISPLAY",
+            SettingRow::Midi => "CONTROLLER",
         }
     }
 
@@ -99,7 +103,7 @@ impl Painter {
 
             let row_h = p.px(46.0);
             let heading_h = p.px(24.0);
-            let sections = 3.0;
+            let sections = 4.0;
             let w = p.px(640.0).min(layout.width - p.px(32.0));
             let h = (row_h * v.rows.len() as f32 + heading_h * sections + p.px(118.0))
                 .min(layout.height - p.px(16.0));
@@ -230,5 +234,85 @@ impl Painter {
             false => SOFT_TEXT,
         };
         self.label(detail, &row.detail, 10.0, ink, Align::Left);
+    }
+}
+
+/// The MIDI learn bar's buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnAction {
+    Done,
+    /// Forget every learned control.
+    Clear,
+}
+
+/// What the MIDI learn bar shows.
+pub struct LearnBar<'a> {
+    /// The connected controller's name.
+    pub controller: Option<&'a str>,
+    /// The control picked on screen, waiting for the controller, and where it is.
+    pub waiting: Option<(&'a str, Area)>,
+    /// The last thing that happened (learned, refused…).
+    pub status: &'a str,
+}
+
+impl Painter {
+    /// MIDI learn: a bar along the bottom (over the browser, never the waveforms) and an
+    /// outline round the control being learned.
+    pub fn learn_bar(&mut self, layout: &Layout, v: LearnBar<'_>) {
+        self.popup(|p| {
+            if let Some((_, area)) = v.waiting {
+                p.push(
+                    Rect::new(
+                        area.x - p.px(3.0),
+                        area.y - p.px(3.0),
+                        area.width + p.px(6.0),
+                        area.height + p.px(6.0),
+                        WARNING,
+                    )
+                    .rounded(p.px(5.0))
+                    .stroke(p.px(2.0)),
+                );
+            }
+            let h = p.px(56.0);
+            let bar = Area::new(0.0, layout.height - h, layout.width, h);
+            p.push(
+                Rect::new(bar.x, bar.y, bar.width, bar.height, Color::rgb(0.06, 0.05, 0.02))
+                    .gradient(Color::rgb(0.035, 0.03, 0.012)),
+            );
+            p.fill(Area::new(bar.x, bar.y, bar.width, p.px(2.0)), WARNING);
+            p.hit(bar, Control::Button(UiAction::Settings(SettingsAction::Nothing)));
+            let inner = Area::new(
+                bar.x + p.px(16.0),
+                bar.y + p.px(10.0),
+                bar.width - p.px(32.0),
+                bar.height - p.px(18.0),
+            );
+            let (done, rest) = inner.split_right(p.px(72.0), p.px(8.0));
+            p.button(done, "DONE", true, WARNING, UiAction::Learn(LearnAction::Done));
+            let (clear, rest) = rest.split_right(p.px(92.0), p.px(16.0));
+            p.tinted_button(
+                clear,
+                "CLEAR ALL",
+                false,
+                DANGER,
+                UiAction::Learn(LearnAction::Clear),
+            );
+            let (title, rest) = rest.split_left(p.px(104.0), p.px(12.0));
+            p.bold(title, "MIDI LEARN", 13.0, WARNING, Align::Left);
+            let (top, bottom) = rest.split_top(rest.height / 2.0, 0.0);
+            let headline = match (v.controller, v.waiting) {
+                (None, _) => "No MIDI controller found: plug one in (it connects within a \
+                              couple of seconds)."
+                    .to_string(),
+                (Some(name), Some((target, _))) => {
+                    format!("Now move or press the control for {target} on {name}")
+                }
+                (Some(name), None) => {
+                    format!("Click a button, knob or fader on screen, then use the one on {name} you want for it")
+                }
+            };
+            p.label(top, headline, 12.0, TEXT, Align::Left);
+            p.label(bottom, v.status, 10.5, SOFT_TEXT, Align::Left);
+        });
     }
 }

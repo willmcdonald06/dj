@@ -21,7 +21,8 @@ use dj_analysis::{TrackAnalysis, Transient};
 use dj_audio_io::{AudioOutput, BufferGrown, CallbackStats};
 use dj_engine::{
     ChannelControl, Command, DeckAction, DeckId, DeckSnapshot, EngineHandle, EngineSnapshot,
-    FxControl, HOT_CUES, HotCue, MasterControl, OutputMode, STEM_COUNT, Stem, TempoRange,
+    FxControl, HOT_CUES, HotCue, MasterControl, OutputMode, SAMPLER_SLOTS, STEM_COUNT,
+    SamplerControl, Stem, TempoRange,
 };
 use dj_library::{AnalysisSource, CollectionKind, CueKind, Library, StoredCue};
 use dj_ui::WaveformStyle;
@@ -30,7 +31,7 @@ use crate::browser::{Browser, Column, Filter, track_key};
 use crate::library_worker::{LibraryWorker, WorkerEvent, to_library, trusted_grid};
 use crate::recorder::{self, RecordEvent, Recorder};
 use crate::settings::{BUFFER_CHOICES, Settings, tempo_range_percent};
-use dj_control::UiEvent;
+use dj_control::{ControlRequest, DeckTarget, GlobalTarget, Target, UiEvent};
 use dj_engine::BeatGrid;
 use dj_loader::{LoadEvent, Loader, TrackInfo};
 use dj_ui::{Delegate, Flow, FrameSize, Input, Key, Scene};
@@ -42,7 +43,7 @@ use deck_view::{DeckView, KeyDisplay};
 use layout::{Area, Layout};
 use mixer_view::MixerView;
 use painter::Painter;
-use settings_view::{RowView, SettingRow, SettingsAction, SettingsView};
+use settings_view::{LearnAction, LearnBar, RowView, SettingRow, SettingsAction, SettingsView};
 
 const SEEK_SECONDS: f32 = 4.0;
 /// Tempo change per Up/Down press: 0.02%, a CDJ's finest step. Holding the key glides.
@@ -115,6 +116,8 @@ enum PadMode {
     Grid,
     /// Pads 1–4 mute and unmute the stems; 5–8 play one alone.
     Stems,
+    /// The shared sampler bank.
+    Sampler,
 }
 
 /// A deck's pad mode, and whether the next hot cue pad press deletes.
@@ -122,6 +125,8 @@ enum PadMode {
 struct PadState {
     mode: PadMode,
     delete_armed: bool,
+    /// MODE was pressed: the next sampler pad pressed changes its play mode.
+    mode_armed: bool,
 }
 
 /// What the app knows about the track on one deck, beyond the engine snapshot.
@@ -174,6 +179,23 @@ pub struct Parts {
     pub controller_events: mpsc::Receiver<UiEvent>,
     /// Records the main output; `None` if it couldn't start.
     pub recorder: Option<Recorder>,
+    /// MIDI learn requests to the control thread (`None` with --no-midi).
+    pub control_requests: Option<mpsc::Sender<ControlRequest>>,
+}
+
+/// The connected MIDI controller, as the control thread reported it.
+struct Midi {
+    name: String,
+    built_in: bool,
+    learned: usize,
+}
+
+/// MIDI learn in progress.
+#[derive(Default)]
+struct Learning {
+    /// The control picked on screen, and where it was drawn.
+    waiting: Option<(Target, Area)>,
+    status: String,
 }
 
 pub struct Frontend {
@@ -209,6 +231,10 @@ pub struct Frontend {
     settings_open: Option<SettingRow>,
     /// Output devices, read when the settings screen opens.
     device_names: Vec<String>,
+    /// What each sampler slot holds, by file name, for the pads.
+    sample_names: [Option<String>; SAMPLER_SLOTS],
+    /// When the sampler's level, sync or modes were last saved.
+    last_sampler_save: Instant,
     /// Why the last audio change didn't work, shown on that row of the settings screen.
     audio_problem: Option<(SettingRow, String)>,
     worker: Option<LibraryWorker>,
@@ -236,6 +262,9 @@ pub struct Frontend {
     last_stats_log: Instant,
     last_xruns: u64,
     recorder: Option<Recorder>,
+    control_requests: Option<mpsc::Sender<ControlRequest>>,
+    midi: Option<Midi>,
+    learning: Option<Learning>,
 }
 
 impl Frontend {
@@ -253,6 +282,7 @@ impl Frontend {
             worker,
             controller_events,
             recorder,
+            control_requests,
         } = parts;
         let mut frontend = Self {
             engine,
@@ -275,6 +305,8 @@ impl Frontend {
             settings_path,
             channels,
             settings_open: None,
+            sample_names: Default::default(),
+            last_sampler_save: Instant::now(),
             device_names: Vec::new(),
             audio_problem: None,
             worker,
@@ -293,8 +325,12 @@ impl Frontend {
             last_stats_log: Instant::now(),
             last_xruns: 0,
             recorder,
+            control_requests,
+            midi: None,
+            learning: None,
         };
         frontend.reload_browser();
+        frontend.restore_sampler();
         frontend
     }
 
@@ -356,10 +392,22 @@ impl Frontend {
                 let pads = &mut self.decks[deck.index()].pads;
                 pads.mode = mode;
                 pads.delete_armed = false;
+                pads.mode_armed = false;
             }
             UiAction::LoadSelected(deck) => self.load_selected(deck),
             UiAction::Record => self.toggle_recording(),
             UiAction::Settings(action) => self.settings_action(action),
+            UiAction::SamplerPad(deck, slot) => self.sampler_pad(deck, slot),
+            UiAction::SamplerModeArm(deck) => {
+                let pads = &mut self.decks[deck.index()].pads;
+                pads.mode_armed = !pads.mode_armed;
+                pads.delete_armed = false;
+            }
+            UiAction::SamplerSync => self.send(Command::Sampler(SamplerControl::ToggleSync)),
+            UiAction::Learn(LearnAction::Done) => self.stop_learning(),
+            UiAction::Learn(LearnAction::Clear) => {
+                self.control_request(ControlRequest::ClearLearned)
+            }
             UiAction::Rescan => {
                 if let Some(worker) = &self.worker {
                     worker.rescan();
@@ -397,6 +445,7 @@ impl Frontend {
             UiAction::DeleteArm(deck) => {
                 let pads = &mut self.decks[deck.index()].pads;
                 pads.delete_armed = !pads.delete_armed;
+                pads.mode_armed = false;
             }
         }
     }
@@ -427,6 +476,9 @@ impl Frontend {
     }
 
     fn pointer_down(&mut self, x: f32, y: f32) {
+        if self.learning.is_some() && self.learn_pick(x, y) {
+            return;
+        }
         // Clicking the browser gives it the arrow keys; clicking elsewhere takes them
         // back.
         if !self.show_help {
@@ -627,6 +679,10 @@ impl Frontend {
                 action: UiAction::Roll(deck, _),
                 ..
             }) => self.send(Command::deck(deck, DeckAction::RollRelease)),
+            Some(Grab::Button {
+                action: UiAction::SamplerPad(_, slot),
+                ..
+            }) => self.send(Command::Sampler(SamplerControl::Release(slot))),
             // A track dropped on a crate or playlist goes into it.
             Some(Grab::Row {
                 track,
@@ -958,6 +1014,7 @@ impl Frontend {
             }
             SettingsAction::Close => self.settings_open = None,
             SettingsAction::Select(row) => self.settings_open = Some(row),
+            SettingsAction::Step(SettingRow::Midi, _) => self.start_learning(),
             SettingsAction::Step(row, by) => {
                 self.settings_open = Some(row);
                 self.step_setting(row, by);
@@ -1038,6 +1095,7 @@ impl Frontend {
                 let notation = step(&notations, &s.key_notation, by);
                 self.change_settings(|s| s.key_notation = notation);
             }
+            SettingRow::Midi => self.start_learning(),
             SettingRow::Waveform => {
                 let styles = [WaveformStyle::Spectrum, WaveformStyle::ThreeBand];
                 let style = step(&styles, &s.waveform, by);
@@ -1162,6 +1220,31 @@ impl Frontend {
                         .to_string(),
                         "How keys are written on the decks and in the browser".to_string(),
                     ),
+                    SettingRow::Midi => match &self.midi {
+                        Some(midi) => (
+                            midi.name.clone(),
+                            match (midi.built_in, midi.learned) {
+                                (true, 0) => {
+                                    "Built-in mapping. Click to learn more controls".to_string()
+                                }
+                                (true, n) => {
+                                    format!("Built-in mapping + {n} learned. Click to learn")
+                                }
+                                (false, 0) => {
+                                    "No mapping yet. Click to teach it with MIDI learn".to_string()
+                                }
+                                (false, n) => format!("{n} learned controls. Click to learn more"),
+                            },
+                        ),
+                        None => (
+                            "None connected".to_string(),
+                            match self.control_requests {
+                                Some(_) => "Plug one in; click to open MIDI learn",
+                                None => "MIDI is off (--no-midi)",
+                            }
+                            .to_string(),
+                        ),
+                    },
                     SettingRow::Waveform => (
                         match s.waveform {
                             WaveformStyle::Spectrum => "Spectrum",
@@ -1187,6 +1270,144 @@ impl Frontend {
                 }
             })
             .collect()
+    }
+
+    fn control_request(&mut self, request: ControlRequest) {
+        let sent = self
+            .control_requests
+            .as_ref()
+            .is_some_and(|requests| requests.send(request).is_ok());
+        if !sent {
+            self.notify("MIDI isn't running (started with --no-midi?).".to_string());
+        }
+    }
+
+    fn start_learning(&mut self) {
+        if self.control_requests.is_none() {
+            self.notify("MIDI is off (--no-midi), so there's nothing to learn from.".to_string());
+            return;
+        }
+        self.settings_open = None;
+        self.learning = Some(Learning {
+            waiting: None,
+            status: "Learned controls are saved as you go. DONE when finished.".to_string(),
+        });
+    }
+
+    fn stop_learning(&mut self) {
+        if self.learning.take().is_some() {
+            self.control_request(ControlRequest::CancelLearn);
+        }
+    }
+
+    /// In MIDI learn, a click picks the control to learn rather than using it. Returns
+    /// whether the click was taken (the learn bar's own buttons work as usual).
+    fn learn_pick(&mut self, x: f32, y: f32) -> bool {
+        let Some(hit) = self
+            .hits
+            .iter()
+            .rev()
+            .find(|h| h.area.contains(x, y))
+            .copied()
+        else {
+            return true;
+        };
+        if let Control::Button(UiAction::Learn(_) | UiAction::Settings(SettingsAction::Nothing)) =
+            hit.control
+        {
+            return false;
+        }
+        let target = learn_target(hit.control);
+        let Some(learning) = &mut self.learning else {
+            return false;
+        };
+        match target {
+            Some(target) => {
+                learning.waiting = Some((target, hit.area));
+                learning.status = format!("Learning {target}…");
+                self.control_request(ControlRequest::Learn(target));
+            }
+            None => {
+                learning.waiting = None;
+                learning.status = "That one can't be mapped to MIDI; pick another.".to_string();
+                self.control_request(ControlRequest::CancelLearn);
+            }
+        }
+        true
+    }
+
+    /// Load the saved sampler bank: its samples, modes, level and sync.
+    fn restore_sampler(&mut self) {
+        let bank = self.settings.sampler.clone();
+        for (slot, mode) in bank.modes.into_iter().enumerate() {
+            self.send(Command::Sampler(SamplerControl::SetMode(slot, mode)));
+        }
+        self.send(Command::Sampler(SamplerControl::SetLevel(bank.level)));
+        self.send(Command::Sampler(SamplerControl::SetSync(bank.sync)));
+        for (slot, path) in bank.paths.into_iter().enumerate() {
+            if let Some(path) = path {
+                self.loader.load_sample(slot, path);
+            }
+        }
+    }
+
+    /// Save the sampler's level, sync and modes when they change (at most once a
+    /// second, since the level knob changes continuously while dragged).
+    fn persist_sampler(&mut self, state: &EngineSnapshot) {
+        let sampler = &state.sampler;
+        let bank = &self.settings.sampler;
+        let modes = sampler.slots.map(|slot| slot.mode);
+        let changed = (bank.level - sampler.level).abs() > 0.001
+            || bank.sync != sampler.sync
+            || bank.modes != modes;
+        if !changed || self.last_sampler_save.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        // Until the engine has the saved bank, it reports defaults: don't save those.
+        if state.frames_processed == 0 {
+            return;
+        }
+        self.last_sampler_save = Instant::now();
+        let (level, sync) = (sampler.level, sampler.sync);
+        self.change_settings(|s| {
+            s.sampler.level = level;
+            s.sampler.sync = sync;
+            s.sampler.modes = modes;
+        });
+    }
+
+    /// A sampler pad press: eject or change mode when armed, load the browser's track
+    /// into an empty slot, else play.
+    fn sampler_pad(&mut self, deck: DeckId, slot: usize) {
+        let pads = &mut self.decks[deck.index()].pads;
+        let delete = std::mem::take(&mut pads.delete_armed);
+        let mode = std::mem::take(&mut pads.mode_armed);
+        let loaded = self.engine.snapshot().sampler.slots[slot].sample.is_some();
+        if delete {
+            self.send(Command::Sampler(SamplerControl::Eject(slot)));
+            self.sample_names[slot] = None;
+            self.change_settings(|s| s.sampler.paths[slot] = None);
+        } else if mode {
+            self.send(Command::Sampler(SamplerControl::CycleMode(slot)));
+        } else if loaded {
+            self.send(Command::Sampler(SamplerControl::Press(slot)));
+        } else {
+            match self.browser.selected() {
+                Some(track) => {
+                    let path = track.path.clone();
+                    self.notify(format!(
+                        "Loading {} into sampler slot {}…",
+                        sample_name(&path),
+                        slot + 1
+                    ));
+                    self.loader.load_sample(slot, path);
+                }
+                None => self.notify(
+                    "Empty slot: pick a sample in the browser, then press the pad to load it."
+                        .to_string(),
+                ),
+            }
+        }
     }
 
     fn toggle_recording(&mut self) {
@@ -1241,6 +1462,51 @@ impl Frontend {
                 UiEvent::BrowsePress => self.browser_focus = !self.browser_focus,
                 UiEvent::Load(deck) => self.load_selected(deck),
                 UiEvent::Back => self.browser_focus = false,
+                UiEvent::Connected {
+                    name,
+                    built_in,
+                    learned,
+                } => {
+                    let fresh = self.midi.as_ref().is_none_or(|m| m.name != name);
+                    if fresh {
+                        self.notify(format!("MIDI controller connected: {name}"));
+                    }
+                    self.midi = Some(Midi {
+                        name,
+                        built_in,
+                        learned,
+                    });
+                }
+                UiEvent::Disconnected => {
+                    if let Some(midi) = self.midi.take() {
+                        self.notify(format!("MIDI controller disconnected: {}", midi.name));
+                    }
+                }
+                UiEvent::Learned { input, target } => {
+                    if let Some(learning) = &mut self.learning {
+                        learning.waiting = None;
+                        learning.status =
+                            format!("Learned: {input} → {target}. Pick the next one.");
+                    }
+                }
+                UiEvent::LearnRefused { input, target } => {
+                    if let Some(learning) = &mut self.learning {
+                        let need = match target {
+                            Target::Deck(_, DeckTarget::Jog)
+                            | Target::Global(GlobalTarget::Browse) => {
+                                "an endless knob or jog wheel"
+                            }
+                            _ => "a knob or fader",
+                        };
+                        learning.status =
+                            format!("{input} can't be {target}: that needs {need}. Try another.");
+                    }
+                }
+                UiEvent::LearnCleared => {
+                    if let Some(learning) = &mut self.learning {
+                        learning.status = "Cleared every learned control.".to_string();
+                    }
+                }
             }
         }
     }
@@ -1433,6 +1699,17 @@ impl Frontend {
         while let Some(event) = self.loader.try_event() {
             crate::log_load_event(&event);
             match event {
+                LoadEvent::SampleLoaded { slot, path, .. } => {
+                    self.sample_names[slot] = Some(sample_name(&path));
+                    self.change_settings(|s| s.sampler.paths[slot] = Some(path.clone()));
+                }
+                LoadEvent::SampleFailed { slot, path, error } => {
+                    self.notify(format!(
+                        "Couldn't load {} into sampler slot {}: {error}",
+                        sample_name(&path),
+                        slot + 1
+                    ));
+                }
                 LoadEvent::Loaded {
                     deck, info, path, ..
                 } => {
@@ -1571,6 +1848,9 @@ impl Delegate for Frontend {
             Input::Scroll { x, y, lines } => self.scroll(x, y, lines),
             Input::KeyDown { repeat: false, .. } if self.show_help => self.show_help = false,
             Input::KeyDown { key, .. } if self.settings_open.is_some() => self.settings_key(key),
+            Input::KeyDown {
+                key: Key::Escape, ..
+            } if self.learning.is_some() => self.stop_learning(),
             Input::KeyDown { key, repeat }
                 if self.browser_wants_keys() && self.browser_key(key, repeat) => {}
             Input::KeyDown { key, repeat } => match key {
@@ -1616,12 +1896,24 @@ impl Delegate for Frontend {
                 Key::Char('t') if !repeat => self.send(Command::ToggleTone),
                 Key::Char('w') if !repeat => self.toggle_recording(),
                 Key::Char('u') if !repeat => self.settings_action(SettingsAction::Open),
+                Key::Char('j') if !repeat => self.deck_action(DeckAction::ToggleSlipMode),
+                Key::Char('d') if !repeat => self.deck_action(DeckAction::ToggleReverse),
                 Key::Char(c @ '1'..='8') if !repeat => {
                     let slot = c as usize - '1' as usize;
                     match self.decks[self.selected.index()].pads.mode {
                         PadMode::Stems => self.press(stem_pad(self.selected, slot)),
+                        PadMode::Sampler => self.press(UiAction::SamplerPad(self.selected, slot)),
                         _ => self.press(UiAction::HotCue(self.selected, slot)),
                     }
+                }
+                Key::Char('n') if !repeat => {
+                    let pads = &mut self.decks[self.selected.index()].pads;
+                    pads.mode = match pads.mode {
+                        PadMode::Sampler => PadMode::HotCue,
+                        _ => PadMode::Sampler,
+                    };
+                    pads.delete_armed = false;
+                    pads.mode_armed = false;
                 }
                 Key::Char('m') if !repeat => {
                     let pads = &mut self.decks[self.selected.index()].pads;
@@ -1653,7 +1945,12 @@ impl Delegate for Frontend {
                 }
                 Key::Char(c @ '1'..='8') => {
                     let slot = c as usize - '1' as usize;
-                    self.deck_action(DeckAction::HotCueRelease(slot));
+                    match self.decks[self.selected.index()].pads.mode {
+                        PadMode::Sampler => {
+                            self.send(Command::Sampler(SamplerControl::Release(slot)))
+                        }
+                        _ => self.deck_action(DeckAction::HotCueRelease(slot)),
+                    }
                 }
                 _ => {}
             },
@@ -1682,6 +1979,7 @@ impl Delegate for Frontend {
         self.maybe_log_stats();
         let state = self.engine.snapshot();
         self.persist_cues(&state);
+        self.persist_sampler(&state);
         let stats = self.stats.snapshot();
         let peaks = [
             state.channels[0].peak,
@@ -1789,6 +2087,8 @@ impl Delegate for Frontend {
                 pads: deck_info.pads,
                 loop_beats: deck_info.loop_beats.0,
                 style,
+                sampler: &state.sampler,
+                sample_names: &self.sample_names,
             });
         }
         painter.mixer(MixerView {
@@ -1845,6 +2145,19 @@ impl Delegate for Frontend {
         }
         if self.show_help {
             painter.help(&layout);
+        }
+        if let Some(learning) = &self.learning {
+            let waiting = learning
+                .waiting
+                .map(|(target, area)| (target.to_string(), area));
+            painter.learn_bar(
+                &layout,
+                LearnBar {
+                    controller: self.midi.as_ref().map(|m| m.name.as_str()),
+                    waiting: waiting.as_ref().map(|(name, area)| (name.as_str(), *area)),
+                    status: &learning.status,
+                },
+            );
         }
         if let Some(selected) = self.settings_open {
             let rows = self.setting_rows();
@@ -1985,6 +2298,11 @@ enum UiAction {
     /// Start or stop recording the main output.
     Record,
     Settings(SettingsAction),
+    /// A sampler pad: plays the slot (loads the browser's track into an empty one).
+    SamplerPad(DeckId, usize),
+    SamplerModeArm(DeckId),
+    SamplerSync,
+    Learn(LearnAction),
     Help,
     NewCollection(CollectionKind),
     RenameCollection,
@@ -2043,6 +2361,67 @@ fn list_devices() -> Vec<String> {
         }
     }
     seen
+}
+
+/// What MIDI learn binds when a control is clicked on screen.
+fn learn_target(control: Control) -> Option<Target> {
+    use DeckTarget as D;
+    use GlobalTarget as G;
+    let deck = |deck, target| Some(Target::Deck(deck, target));
+    let global = |target| Some(Target::Global(target));
+    match control {
+        Control::Button(action) => match action {
+            UiAction::Deck(d, action) => match action {
+                DeckAction::PlayPause => deck(d, D::Play),
+                DeckAction::ToggleKeyLock => deck(d, D::KeyLock),
+                DeckAction::LoopIn => deck(d, D::LoopIn),
+                DeckAction::LoopOut => deck(d, D::LoopOut),
+                DeckAction::ReloopExit => deck(d, D::Reloop),
+                DeckAction::ToggleSlipMode => deck(d, D::Slip),
+                DeckAction::ToggleReverse => deck(d, D::Reverse),
+                _ => None,
+            },
+            UiAction::Cue(d) => deck(d, D::Cue),
+            UiAction::Sync(d) => deck(d, D::Sync),
+            UiAction::HotCue(d, n) => deck(d, D::HotCue(n as u8)),
+            UiAction::AutoLoop(d) => deck(d, D::Loop),
+            UiAction::LoopSize(d, factor) if factor < 1.0 => deck(d, D::LoopHalve),
+            UiAction::LoopSize(d, _) => deck(d, D::LoopDouble),
+            UiAction::Pfl(d) => deck(d, D::HeadphoneCue),
+            UiAction::LoadSelected(d) => deck(d, D::Load),
+            // The bend buttons stand for the jog wheel.
+            UiAction::Nudge(d, _) => deck(d, D::Jog),
+            UiAction::Quantize => global(G::Quantize),
+            UiAction::Fx(FxControl::ToggleOn) => global(G::FxOn),
+            UiAction::Fx(FxControl::StepKind(_)) => global(G::FxNext),
+            UiAction::Fx(FxControl::Tap) => global(G::FxTap),
+            UiAction::SamplerPad(_, n) => global(G::SamplerPad(n as u8)),
+            _ => None,
+        },
+        Control::Slider(slider, _) => match slider {
+            Slider::Tempo(d) => deck(d, D::Tempo),
+            Slider::Trim(d) => deck(d, D::Trim),
+            Slider::Eq(d, 0) => deck(d, D::EqLow),
+            Slider::Eq(d, 1) => deck(d, D::EqMid),
+            Slider::Eq(d, _) => deck(d, D::EqHigh),
+            Slider::Filter(d) => deck(d, D::Filter),
+            Slider::Fader(d) => deck(d, D::Fader),
+            Slider::Main => global(G::MainLevel),
+            Slider::Phones => global(G::PhonesLevel),
+            Slider::CueMix => global(G::CueMix),
+            Slider::FxLevel => global(G::FxLevel),
+            Slider::SamplerLevel => global(G::SamplerLevel),
+        },
+        Control::BrowserList | Control::BrowserRow(_) => global(G::Browse),
+        _ => None,
+    }
+}
+
+/// A sample's name for its pad: the file name without the extension.
+fn sample_name(path: &std::path::Path) -> String {
+    path.file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// What to tell the user about a recorder event.
@@ -2118,6 +2497,7 @@ enum Slider {
     CueMix,
     /// The beat FX level.
     FxLevel,
+    SamplerLevel,
 }
 
 impl Slider {
@@ -2141,6 +2521,7 @@ impl Slider {
             Slider::Phones => state.master.phones_level,
             Slider::CueMix => state.master.cue_mix,
             Slider::FxLevel => state.fx.level,
+            Slider::SamplerLevel => state.sampler.level,
         }
     }
 
@@ -2160,6 +2541,7 @@ impl Slider {
             Slider::Phones => Command::Master(MasterControl::PhonesLevel(unit)),
             Slider::CueMix => Command::Master(MasterControl::CueMix(unit)),
             Slider::FxLevel => Command::Fx(FxControl::SetLevel(unit)),
+            Slider::SamplerLevel => Command::Sampler(SamplerControl::SetLevel(unit)),
         }
     }
 
@@ -2170,6 +2552,7 @@ impl Slider {
             _ if self.centred() => 0.5,
             Slider::CueMix => 0.0,
             Slider::FxLevel => 0.5,
+            Slider::SamplerLevel => dj_engine::SAMPLER_DEFAULT_LEVEL,
             _ => 1.0,
         }
     }
@@ -2273,6 +2656,43 @@ fn clock(frames: u64, sample_rate: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clicked_controls_become_learn_targets() {
+        use dj_control::{DeckTarget, GlobalTarget, Target};
+        let fader = Control::Slider(
+            Slider::Fader(DeckId::B),
+            Drag::Vertical {
+                inverted: true,
+                top: 0.0,
+                travel: 1.0,
+            },
+        );
+        assert_eq!(
+            learn_target(fader),
+            Some(Target::Deck(DeckId::B, DeckTarget::Fader))
+        );
+        assert_eq!(
+            learn_target(Control::Button(UiAction::Deck(
+                DeckId::A,
+                DeckAction::PlayPause
+            ))),
+            Some(Target::Deck(DeckId::A, DeckTarget::Play))
+        );
+        assert_eq!(
+            learn_target(Control::Button(UiAction::HotCue(DeckId::A, 6))),
+            Some(Target::Deck(DeckId::A, DeckTarget::HotCue(6)))
+        );
+        assert_eq!(
+            learn_target(Control::Button(UiAction::SamplerPad(DeckId::B, 2))),
+            Some(Target::Global(GlobalTarget::SamplerPad(2)))
+        );
+        assert_eq!(
+            learn_target(Control::BrowserList),
+            Some(Target::Global(GlobalTarget::Browse))
+        );
+        assert_eq!(learn_target(Control::Button(UiAction::Help)), None);
+    }
+
     use super::*;
     use dj_analysis::analyze_frames;
     use dj_engine::TrackId;

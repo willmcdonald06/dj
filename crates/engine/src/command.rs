@@ -22,6 +22,8 @@ pub enum Command {
     Master(MasterControl),
     /// The beat FX unit.
     Fx(FxControl),
+    /// The sampler bank.
+    Sampler(crate::SamplerControl),
     /// Quantize (snap cues and jumps to the beatgrid) on or off, for both decks.
     SetQuantize(bool),
     ToggleQuantize,

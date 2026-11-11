@@ -24,6 +24,7 @@ pub struct EngineSnapshot {
     pub main_peak: f32,
     /// Internal mix, or per-deck outputs with the software mixer bypassed.
     pub output_mode: crate::OutputMode,
+    pub sampler: crate::SamplerSnapshot,
 }
 
 impl EngineSnapshot {
@@ -51,6 +52,7 @@ impl Default for EngineSnapshot {
             frames_processed: 0,
             main_peak: 0.0,
             output_mode: crate::OutputMode::InternalMix,
+            sampler: crate::SamplerSnapshot::default(),
         }
     }
 }

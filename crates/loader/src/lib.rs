@@ -106,9 +106,34 @@ pub enum LoadEvent {
         path: PathBuf,
         error: LoadError,
     },
+    /// A sample is in sampler slot `slot`.
+    SampleLoaded {
+        slot: usize,
+        path: PathBuf,
+        seconds: f64,
+        /// Its tempo, if it has one (used to sync loops).
+        bpm: Option<f32>,
+    },
+    SampleFailed {
+        slot: usize,
+        path: PathBuf,
+        error: String,
+    },
 }
 
+/// Longest sample a sampler slot takes; anything longer belongs on a deck.
+pub const MAX_SAMPLE_SECONDS: f64 = 60.0;
+
 enum Message {
+    LoadSample {
+        slot: usize,
+        path: PathBuf,
+    },
+    SampleReady {
+        slot: usize,
+        path: PathBuf,
+        result: Result<(Arc<Track>, Option<f32>), String>,
+    },
     Load {
         deck: DeckId,
         path: PathBuf,
@@ -194,6 +219,18 @@ impl Loader {
         }
     }
 
+    /// Load `path` into sampler slot `slot`. The result arrives as
+    /// [`LoadEvent::SampleLoaded`] or [`LoadEvent::SampleFailed`].
+    pub fn load_sample(&self, slot: usize, path: PathBuf) {
+        if self
+            .requests
+            .send(Message::LoadSample { slot, path })
+            .is_err()
+        {
+            tracing::error!("loader thread has stopped");
+        }
+    }
+
     /// The next load event, if any. Never blocks.
     pub fn try_event(&self) -> Option<LoadEvent> {
         self.events.try_recv().ok()
@@ -238,6 +275,48 @@ fn load_track_stems(
         elapsed: loaded.elapsed,
     };
     Ok((Arc::new(loaded.stems), info))
+}
+
+/// Decode a whole sample and find its tempo.
+fn decode_sample(
+    path: &std::path::Path,
+    id: TrackId,
+    engine_rate: u32,
+) -> Result<(Arc<Track>, Option<f32>), String> {
+    let cancel = AtomicBool::new(false);
+    let mut decoded = None;
+    let mut on_playable = |track: Arc<Track>, _info: TrackInfo| decoded = Some(track);
+    decode_file(path, id, engine_rate, &cancel, &mut on_playable).map_err(|e| e.to_string())?;
+    let track = decoded.ok_or("the file has no audio")?;
+    let seconds = track.len_frames() as f64 / engine_rate as f64;
+    if seconds > MAX_SAMPLE_SECONDS {
+        return Err(format!(
+            "it's {:.0} s long; samples can be up to {MAX_SAMPLE_SECONDS:.0} s (load whole \
+             tracks onto a deck)",
+            seconds
+        ));
+    }
+    let analysis = dj_analysis::analyze(&track);
+    let grid_bpm = analysis
+        .grid
+        .filter(|g| g.confidence >= SAMPLE_GRID_CONFIDENCE)
+        .map(|g| g.grid.bpm(engine_rate));
+    Ok((track, sample_bpm(seconds, grid_bpm).map(|bpm| bpm as f32)))
+}
+
+/// Grid confidence needed to trust a sample's own beat tracking over its length.
+const SAMPLE_GRID_CONFIDENCE: f64 = 0.18;
+
+/// A sample's tempo. Loops are almost always whole bars, so the tempo that fits a
+/// power of two beats into its length (between 85 and 170 BPM) is exact; the beat
+/// tracker is only used for samples too short for that. (On a short loop the tracker
+/// is easily fooled: a 2-bar loop at 128 BPM is also 12 beats at 192.)
+pub fn sample_bpm(seconds: f64, grid_bpm: Option<f64>) -> Option<f64> {
+    let from_length = (0..=7)
+        .map(|power| f64::from(1u32 << power) * 60.0 / seconds)
+        .find(|bpm| (85.0..170.0).contains(bpm))
+        .filter(|_| seconds > 0.2);
+    from_length.or(grid_bpm)
 }
 
 struct Job {
@@ -361,7 +440,48 @@ impl Manager {
                 };
                 self.emit(event);
             }
+            Message::LoadSample { slot, path } => self.start_sample(slot, path),
+            Message::SampleReady { slot, path, result } => {
+                let event = match result {
+                    Ok((track, bpm)) => {
+                        let seconds = track.len_frames() as f64 / self.engine_rate as f64;
+                        self.held.push(Arc::clone(&track));
+                        match self.tracks.send_sample(slot, track, bpm) {
+                            Ok(()) => LoadEvent::SampleLoaded {
+                                slot,
+                                path,
+                                seconds,
+                                bpm,
+                            },
+                            Err(_) => LoadEvent::SampleFailed {
+                                slot,
+                                path,
+                                error: "the engine is busy; try again".into(),
+                            },
+                        }
+                    }
+                    Err(error) => LoadEvent::SampleFailed { slot, path, error },
+                };
+                self.emit(event);
+            }
             Message::Shutdown => {}
+        }
+    }
+
+    /// Decode a sample on its own thread: all of it, before it goes to the engine.
+    fn start_sample(&mut self, slot: usize, path: PathBuf) {
+        let id = TrackId(self.next_id);
+        self.next_id += 1;
+        let outbox = self.outbox.clone();
+        let engine_rate = self.engine_rate;
+        let spawned = std::thread::Builder::new()
+            .name(format!("sample-{slot}"))
+            .spawn(move || {
+                let result = decode_sample(&path, id, engine_rate);
+                let _ = outbox.send(Message::SampleReady { slot, path, result });
+            });
+        if let Err(err) = spawned {
+            tracing::error!("cannot start sample decode thread: {err}");
         }
     }
 
@@ -439,5 +559,22 @@ impl Manager {
     fn emit(&self, event: LoadEvent) {
         // The UI may have gone away during shutdown; nothing to do then.
         let _ = self.events.send(event);
+    }
+}
+
+#[cfg(test)]
+mod sample_tests {
+    use super::sample_bpm;
+
+    #[test]
+    fn sample_tempo_from_length_and_tracker() {
+        // Two bars at 128 BPM: 8 beats in 3.75 s.
+        let two_bars = 8.0 * 60.0 / 128.0;
+        assert!((sample_bpm(two_bars, None).unwrap() - 128.0).abs() < 1e-9);
+        // The length wins over the tracker, which is easily fooled on short loops.
+        assert!((sample_bpm(two_bars, Some(192.0)).unwrap() - 128.0).abs() < 1e-9);
+        // Too short to be a loop: the tracker, if anything.
+        assert_eq!(sample_bpm(0.1, None), None);
+        assert_eq!(sample_bpm(0.1, Some(120.0)), Some(120.0));
     }
 }

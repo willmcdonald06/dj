@@ -9,19 +9,22 @@
 //! Not RT-safe; runs on the control thread.
 
 pub mod dj505;
+pub mod learn;
 pub mod monitor;
 mod ports;
 mod thread;
 
+pub use learn::{DeckTarget, GlobalTarget, MidiInput, Target};
 pub use ports::{MidiError, MidiPorts, port_names};
-pub use thread::{ControlSettings, Controller};
+pub use thread::{ControlRequest, ControlSettings, Controller};
 
 use std::time::Instant;
 
 use dj_engine::{Command, DeckId, EngineSnapshot};
 
-/// Something for the UI rather than the engine: browsing and loading tracks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Something for the UI rather than the engine: browsing and loading tracks, and what
+/// the controller connection and MIDI learn are doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiEvent {
     /// Move the browser selection by this many rows (negative is up).
     Browse(i32),
@@ -31,6 +34,26 @@ pub enum UiEvent {
     Load(DeckId),
     /// The BACK button.
     Back,
+    /// A controller is connected: its port name (without the ALSA numbers), whether a
+    /// built-in mapping knows it, and how many controls have been learned for it.
+    Connected {
+        name: String,
+        built_in: bool,
+        learned: usize,
+    },
+    Disconnected,
+    /// MIDI learn bound a control.
+    Learned {
+        input: MidiInput,
+        target: Target,
+    },
+    /// MIDI learn got a control that can't do the job (a button for a fader, say).
+    LearnRefused {
+        input: MidiInput,
+        target: Target,
+    },
+    /// The learned controls were cleared.
+    LearnCleared,
 }
 
 /// A raw message from a controller (a MIDI message, or later a custom-board packet).

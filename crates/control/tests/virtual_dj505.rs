@@ -49,6 +49,7 @@ fn fake_dj505_drives_the_engine_and_gets_leds() {
         control,
         ControlSettings {
             port: Some("virtual test".into()),
+            mappings: None,
         },
         std::sync::mpsc::channel().0,
     )

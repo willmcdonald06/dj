@@ -273,7 +273,7 @@ impl Dj505 {
                     HotCue::Empty => PAD_OFF,
                     _ => HOT_CUE_PAD_COLORS[pad],
                 },
-                PadMode::Roll => match state.slip_position.is_some() {
+                PadMode::Roll => match state.rolling {
                     true => PAD_GREEN,
                     false => PAD_GREEN | PAD_DIM,
                 },

@@ -51,6 +51,9 @@ Roland DJ-505 and targets a Raspberry Pi CM5 with a 7″ touchscreen.
 - **Milestone 9 (CM5 / Linux port):** waiting for the hardware.
 - **Milestone 10 (hardware modes, desktop parts):** recording, the settings screen and
   per-deck output routing done. See [Recording](#recording) and [Settings](#settings).
+- **Spec features added since:** the sampler (pads, spec 5.5), slip mode and reverse
+  (spec 5.1), and MIDI learn for any controller. See [Sampler](#sampler),
+  [Slip and reverse](#slip-and-reverse) and [MIDI learn](#midi-learn).
 
 ## Build and run
 
@@ -106,8 +109,8 @@ silence (only until you touch the deck). HELP (or **H**) lists every key.
 
 Keys act on the selected deck: **Tab** selects deck A/B, **Space** play/pause, **C**
 (hold) CUE, **Left/Right** seek 4 s, **Up/Down** tempo ±0.02% (**PgUp/PgDn** ±1%),
-**,/.** nudge, **S** sync on/off, **K** key lock, **Q** quantize, **R**
-tempo range, **P** headphone cue, **E** eject, **W** record, **U** settings, **T** test tone, **F11** fullscreen (close the window to quit). Drop a file on the
+**,/.** nudge, **S** sync on/off, **K** key lock, **Q** quantize, **J** slip, **D** reverse, **R**
+tempo range, **P** headphone cue, **E** eject, **W** record, **U** settings, **N** sampler pads, **T** test tone, **F11** fullscreen (close the window to quit). Drop a file on the
 window to load it onto the selected deck (refused while that deck plays).
 
 CUE works like a CDJ: while playing, CUE returns to the cue point and stops. While
@@ -290,6 +293,77 @@ How it works (`crates/engine/src/stems.rs`):
 `cargo run --release -p dj-loader --example stems -- TRACK [OUT.wav]` reports a stems
 file's alignment, residual, size and load time, and can write 20 s with the vocals
 taken out to check by ear.
+
+## MIDI learn
+
+Any MIDI controller works through MIDI learn. Open the settings (**U**) and click the
+**MIDI controller** row: a bar comes up along the bottom. Click a button, knob or fader
+on screen, then press or move the one on the controller you want for it; repeat, then
+**DONE** (or **Esc**). **CLEAR ALL** forgets the controller's learned controls.
+
+- Buttons can be learned from notes or CCs; knobs and faders need a CC or pitch bend
+  (14-bit), and a button offered for a fader is refused with a message. The bend (◂ ▸)
+  buttons stand for the jog wheel and the track list for the browse knob: both take
+  endless encoders (either common encoding is recognised).
+- Learned controls win over a built-in mapping, so the DJ-505's can be changed too.
+- Buttons with a state (play, sync, key lock, hot cues, loop, slip, reverse, headphone
+  cue, quantize, FX on, sampler pads) get their LED lit by sending the note back, which
+  most controllers understand.
+- With no controller that the app knows, it connects to the first MIDI input it finds
+  (or the one `--midi NAME` names), so it can be taught.
+
+Each controller's controls are saved to `~/.config/dj/mappings/<controller>.toml`
+(next to the settings file), one line per control, and can be edited by hand:
+
+```toml
+port = "DDJ-400:DDJ-400 MIDI 1"
+bindings = [
+  { midi = "note 1 0x0B", action = "deck A play" },
+  { midi = "cc 1 0x13", action = "deck A fader" },
+]
+```
+
+`midi` is `note CH NUM`, `cc CH NUM` or `pitch CH` (channels 1–16). Deck actions are
+`deck A …` or `deck B …` followed by: play, cue, sync, key lock, hot cue 1–8, loop,
+loop halve, loop double, loop in, loop out, reloop, slip, reverse, headphone cue,
+load, tempo, fader, trim, eq low, eq mid, eq high, filter, jog. The others: quantize,
+fx on, fx next, fx tap, fx level, main level, phones level, cue mix, sampler 1–8,
+sampler level, browse, browse press.
+
+`cargo run -p dj-control --example fake_controller` makes a virtual controller (Linux)
+for trying it without hardware.
+
+## Slip and reverse
+
+**REV** (or **D**) plays the deck backwards at its tempo, fading in and out so the
+switch doesn't click; it stops at the start of the track. Backwards playback is
+varispeed (the stretcher only reads forwards), so key lock doesn't apply while
+reversing; at 0% tempo nothing changes pitch.
+
+**SLIP** (or **J**) is CDJ-style slip mode: the track keeps running underneath (shown as
+a thin marker on the waveform) while a loop, reverse, a scratch or a held hot cue takes
+the playhead away, and playback rejoins it when that ends. Reverse with slip on is a
+censor. Roll pads always slip, with or without SLIP.
+
+## Sampler
+
+One bank of eight sample slots, shared by both decks' pads: the **SAMPLER** pad mode
+(or **N**; keys 1–8 play the pads). Samples go to the main output, at the level of the
+small knob next to SYNC, and come back after a restart (the bank is kept in the
+settings file).
+
+- **Loading:** pick a file in the browser and press an empty pad (they say LOAD).
+  Samples can be up to 60 s; whole tracks belong on a deck. **DELETE** then a pad
+  empties it.
+- **Play modes** (**MODE** then a pad cycles them): **ONE SHOT** (orange) plays to the
+  end and restarts on a second press, **GATE** (purple) plays while held, **LOOP**
+  (green) repeats until pressed again.
+- **Quantize:** with quantize on and a deck playing, a press starts on the next beat.
+- **SYNC:** loops play at the main deck's tempo (the sync master, else the playing deck
+  with the higher fader). They're sped up or slowed down to fit, so their pitch moves
+  with the tempo, as with key lock off. The sample's own tempo comes from its length,
+  assuming it's a whole number of bars (1, 2, 4… beats between 85 and 170 BPM), so
+  trim loops to the bar. One-shots and gated samples always play at their own speed.
 
 ## Beat FX
 

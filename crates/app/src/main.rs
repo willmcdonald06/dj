@@ -227,6 +227,7 @@ fn build_frontend(
         worker,
         controller_events: app.controller_events,
         recorder,
+        control_requests: app.controller.as_ref().map(Controller::requests),
     };
     Ok((frontend::Frontend::new(parts), app.controller))
 }
@@ -241,6 +242,23 @@ fn music_folders(cli: &Cli) -> Vec<std::path::PathBuf> {
         .filter(|p| p.is_dir())
         .into_iter()
         .collect()
+}
+
+/// The controller settings, with learned MIDI mappings kept in `mappings` next to the
+/// settings file.
+fn control_settings(cli: &Cli) -> dj_control::ControlSettings {
+    let settings = cli
+        .settings_file
+        .clone()
+        .unwrap_or_else(Settings::default_path);
+    let folder = settings
+        .parent()
+        .map(|folder| folder.join("mappings"))
+        .unwrap_or_else(|| std::path::PathBuf::from("mappings"));
+    dj_control::ControlSettings {
+        mappings: Some(folder),
+        ..cli.control.clone()
+    }
 }
 
 /// Where recordings go: --recordings, else a Recordings folder in the first music
@@ -323,7 +341,7 @@ fn start(cli: &Cli, settings: &Settings) -> anyhow::Result<Running> {
     let controller = match cli.no_midi {
         true => None,
         false => Some(
-            Controller::spawn(control, cli.control.clone(), controller_tx)
+            Controller::spawn(control, control_settings(cli), controller_tx)
                 .context("starting control thread")?,
         ),
     };
@@ -447,6 +465,25 @@ pub(crate) fn log_load_event(event: &LoadEvent) {
             "deck {deck:?}: stems loaded in {elapsed:.1?}: {:.0} MB, offset {offset} frames, \
              residual {residual_db:.1} dB",
             *bytes as f64 / 1e6,
+        ),
+        LoadEvent::SampleLoaded {
+            slot,
+            path,
+            seconds,
+            bpm,
+        } => tracing::info!(
+            "sampler slot {}: {} ({seconds:.1} s{})",
+            slot + 1,
+            path.display(),
+            match bpm {
+                Some(bpm) => format!(", {bpm:.1} BPM"),
+                None => String::new(),
+            }
+        ),
+        LoadEvent::SampleFailed { slot, path, error } => tracing::warn!(
+            "sampler slot {}: can't load {}: {error}",
+            slot + 1,
+            path.display()
         ),
         LoadEvent::StemsFailed { deck, error, .. } => {
             tracing::warn!("deck {deck:?}: stems not loaded: {error}")

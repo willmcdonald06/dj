@@ -25,6 +25,7 @@ mod mixer;
 mod osc;
 mod record;
 mod routing;
+mod sampler;
 mod snapshot;
 pub mod stem_codec;
 mod stems;
@@ -46,6 +47,10 @@ pub use mixer::{
 };
 pub use record::{RECORD_CHANNELS, RECORD_QUEUE_SECONDS, RecordSource};
 pub use routing::{OutputMode, OutputRouting, StereoPair};
+pub use sampler::{
+    DEFAULT_LEVEL as SAMPLER_DEFAULT_LEVEL, SAMPLER_SLOTS, SampleMode, SamplerControl,
+    SamplerSnapshot, SlotSnapshot,
+};
 pub use snapshot::EngineSnapshot;
 pub use stems::{STEM_COUNT, STEM_RAMP_SECONDS, Stem, StemCache, StemSet, StemsSnapshot};
 pub use track::{TRACK_CHANNELS, Track, TrackId, TrackWriter};
@@ -57,6 +62,7 @@ use dj_stretch::Signalsmith;
 use mixer::Mixer;
 use osc::SineOsc;
 use record::RecordTap;
+use sampler::Sampler;
 
 /// Capacity of the command queue into the audio thread. Also bounds how many commands
 /// a single callback will process.
@@ -106,8 +112,20 @@ impl std::error::Error for QueueFull {}
 /// A track, or a track's stems, ready to go onto a deck.
 #[derive(Debug)]
 pub enum TrackLoad {
-    Track { deck: DeckId, track: Arc<Track> },
-    Stems { deck: DeckId, stems: Arc<StemSet> },
+    Track {
+        deck: DeckId,
+        track: Arc<Track>,
+    },
+    Stems {
+        deck: DeckId,
+        stems: Arc<StemSet>,
+    },
+    /// A sample for a sampler slot, with its tempo if known.
+    Sample {
+        slot: usize,
+        track: Arc<Track>,
+        bpm: Option<f32>,
+    },
 }
 
 /// Loader-side sender of decoded tracks to the audio thread. Not RT-safe to create;
@@ -128,6 +146,16 @@ impl TrackSender {
     /// been loaded since. As with tracks, the caller keeps a reference.
     pub fn send_stems(&mut self, deck: DeckId, stems: Arc<StemSet>) -> Result<(), TrackLoad> {
         self.push(TrackLoad::Stems { deck, stems })
+    }
+
+    /// Queue a sample for sampler `slot`. As with tracks, the caller keeps a reference.
+    pub fn send_sample(
+        &mut self,
+        slot: usize,
+        track: Arc<Track>,
+        bpm: Option<f32>,
+    ) -> Result<(), TrackLoad> {
+        self.push(TrackLoad::Sample { slot, track, bpm })
     }
 
     fn push(&mut self, load: TrackLoad) -> Result<(), TrackLoad> {
@@ -173,6 +201,7 @@ pub struct Engine {
     /// Per-deck render buffers, `[deck][channel]`, [`RENDER_BLOCK`] frames each.
     deck_audio: [[Vec<f32>; 2]; 2],
     mixer: Mixer,
+    sampler: Sampler,
     sync: sync::Sync,
     state: EngineSnapshot,
     tone: SineOsc,
@@ -237,6 +266,7 @@ impl Engine {
             }),
             deck_audio: [0, 1].map(|_| [vec![0.0; RENDER_BLOCK], vec![0.0; RENDER_BLOCK]]),
             mixer: Mixer::new(config.sample_rate),
+            sampler: Sampler::new(config.sample_rate),
             sync: sync::Sync::default(),
             state: initial,
             tone,
@@ -280,6 +310,8 @@ impl Engine {
         self.sync.update(&mut self.decks, self.config.sample_rate);
         let clock = self.fx_clock();
         self.mixer.set_fx_clock(clock);
+        let main = self.main_deck().and_then(|deck| self.deck_clock(deck));
+        self.sampler.set_clock(main, self.state.quantize);
 
         let routing = self.config.routing;
         let channels = routing.channels;
@@ -320,10 +352,11 @@ impl Engine {
                     // Mixing happens in an external analog mixer: each deck goes out raw.
                     OutputMode::PerDeck => (decks[0], decks[1]),
                 };
+                let sample = self.sampler.next_frame();
                 // Never send the device more than full scale.
                 let main = (
-                    (main.0 + tone).clamp(-1.0, 1.0),
-                    (main.1 + tone).clamp(-1.0, 1.0),
+                    (main.0 + sample.0 + tone).clamp(-1.0, 1.0),
+                    (main.1 + sample.1 + tone).clamp(-1.0, 1.0),
                 );
                 peak = peak.max(main.0.abs()).max(main.1.abs());
                 frame[routing.main.left] = main.0;
@@ -352,6 +385,7 @@ impl Engine {
         }
         self.state.master = self.mixer.master_snapshot();
         self.state.fx = self.mixer.fx_snapshot();
+        self.state.sampler = self.sampler.snapshot();
         for snapshots in &mut self.snapshots {
             snapshots.write(self.state);
         }
@@ -369,6 +403,7 @@ impl Engine {
             match load {
                 TrackLoad::Track { deck, track } => self.decks[deck.index()].load(Some(track)),
                 TrackLoad::Stems { deck, stems } => self.decks[deck.index()].set_stems(stems),
+                TrackLoad::Sample { slot, track, bpm } => self.sampler.load(slot, track, bpm),
             }
         }
     }
@@ -388,27 +423,35 @@ impl Engine {
     }
 
     /// The tempo and beat the FX follows: its target deck's, or for the main mix the
-    /// sync master's, else the playing deck with the higher fader.
+    /// main deck's.
     fn fx_clock(&self) -> Option<FxClock> {
         let deck = match self.mixer.fx_snapshot().target {
             FxTarget::Deck(deck) => deck.index(),
-            FxTarget::Main => {
-                let master = self
-                    .sync
-                    .master()
-                    .filter(|&i| self.decks[i].sync_lock() && self.decks[i].grid().is_some());
-                let playing =
-                    |i: usize| self.decks[i].is_moving() && self.decks[i].grid().is_some();
-                let fader = |i: usize| self.mixer.channel_snapshot(i).fader;
-                match (master, playing(0), playing(1)) {
-                    (Some(i), _, _) => i,
-                    (None, true, true) if fader(1) > fader(0) => 1,
-                    (None, true, _) => 0,
-                    (None, false, true) => 1,
-                    (None, false, false) => return None,
-                }
-            }
+            FxTarget::Main => self.main_deck()?,
         };
+        self.deck_clock(deck)
+    }
+
+    /// The deck leading the main mix: the sync master, else the playing deck with the
+    /// higher fader (only decks with a grid count).
+    fn main_deck(&self) -> Option<usize> {
+        let master = self
+            .sync
+            .master()
+            .filter(|&i| self.decks[i].sync_lock() && self.decks[i].grid().is_some());
+        let playing = |i: usize| self.decks[i].is_moving() && self.decks[i].grid().is_some();
+        let fader = |i: usize| self.mixer.channel_snapshot(i).fader;
+        match (master, playing(0), playing(1)) {
+            (Some(i), _, _) => Some(i),
+            (None, true, true) if fader(1) > fader(0) => Some(1),
+            (None, true, _) => Some(0),
+            (None, false, true) => Some(1),
+            (None, false, false) => None,
+        }
+    }
+
+    /// A deck's tempo, and its beat while it moves.
+    fn deck_clock(&self, deck: usize) -> Option<FxClock> {
         let deck = &self.decks[deck];
         let grid = deck.grid()?;
         let bpm = (grid.bpm(self.config.sample_rate) * deck.tempo_rate() as f64) as f32;
@@ -461,6 +504,7 @@ impl Engine {
             Command::Channel { deck, control } => self.mixer.apply_channel(deck.index(), control),
             Command::Master(control) => self.mixer.apply_master(control),
             Command::Fx(control) => self.mixer.apply_fx(control),
+            Command::Sampler(control) => self.sampler.apply(control),
             Command::SetToneEnabled(enabled) => {
                 self.state.tone_enabled = enabled;
                 self.tone.set_enabled(enabled);

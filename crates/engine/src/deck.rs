@@ -209,6 +209,13 @@ pub enum DeckAction {
     /// Hand off the platter: a playing deck carries on at its tempo; a stopped one
     /// stays where it was left.
     ScratchEnd,
+    /// Slip mode: loops, reverse, scratching and held hot cues return to where the
+    /// track would have been when they end.
+    SetSlipMode(bool),
+    ToggleSlipMode,
+    /// Play backwards.
+    SetReverse(bool),
+    ToggleReverse,
     /// Play only this stem (an acapella, say); if it already plays alone, bring all
     /// the stems back.
     SoloStem(Stem),
@@ -268,6 +275,10 @@ pub struct DeckSnapshot {
     /// A loop start waiting for LOOP OUT.
     pub loop_in: Option<f64>,
     /// While rolling: where the track would be without the roll.
+    pub slip_mode: bool,
+    pub reverse: bool,
+    /// A roll pad is held.
+    pub rolling: bool,
     pub slip_position: Option<f64>,
     pub stems: StemsSnapshot,
     /// A hand is on the platter.
@@ -297,6 +308,9 @@ impl Default for DeckSnapshot {
             loop_region: None,
             loop_active: false,
             loop_in: None,
+            slip_mode: false,
+            reverse: false,
+            rolling: false,
             slip_position: None,
             stems: StemsSnapshot::default(),
             scratching: false,
@@ -354,6 +368,15 @@ pub struct Deck {
     loop_active: bool,
     loop_in: Option<f64>,
     slip: Option<Slip>,
+    slip_mode: bool,
+    /// In slip mode, while a loop, reverse, scratch or held hot cue has taken the
+    /// playhead away: where the track would be without it.
+    shadow: Option<f64>,
+    /// A hot cue held in slip mode (released, the track rejoins its shadow).
+    slip_hot_cue: Option<usize>,
+    reverse: bool,
+    /// A direction change waiting for the fade-out to finish.
+    pending_reverse: Option<bool>,
     wraps: PendingWraps,
     // Track progress, loaded once per callback so the per-frame loop does fewer atomic
     // loads.
@@ -406,6 +429,11 @@ impl Deck {
             loop_active: false,
             loop_in: None,
             slip: None,
+            slip_mode: false,
+            shadow: None,
+            slip_hot_cue: None,
+            reverse: false,
+            pending_reverse: None,
             wraps: PendingWraps::default(),
             block_ready: 0,
             block_len: 0,
@@ -435,6 +463,10 @@ impl Deck {
         self.loop_active = false;
         self.loop_in = None;
         self.slip = None;
+        self.shadow = None;
+        self.slip_hot_cue = None;
+        self.reverse = false;
+        self.pending_reverse = None;
         self.wraps.clear();
         self.stems.reset();
         self.scratch = None;
@@ -476,6 +508,14 @@ impl Deck {
             }
             // Sync is coordinated by the engine, which sees both decks.
             DeckAction::SetSyncLock(_) | DeckAction::ToggleSyncLock => {
+                return;
+            }
+            DeckAction::SetSlipMode(on) => {
+                self.set_slip_mode(on);
+                return;
+            }
+            DeckAction::ToggleSlipMode => {
+                self.set_slip_mode(!self.slip_mode);
                 return;
             }
             _ => {}
@@ -546,6 +586,10 @@ impl Deck {
             DeckAction::Eject => self.load(None),
             DeckAction::HotCuePress(slot) => self.hot_cue_press(slot),
             DeckAction::HotCueRelease(slot) => {
+                if self.slip_hot_cue == Some(slot) {
+                    self.slip_hot_cue = None;
+                    self.end_slip();
+                }
                 if self.hot_cue_preview == Some(slot) {
                     self.hot_cue_preview = None;
                     if self.transport == Transport::CuePreview {
@@ -569,10 +613,21 @@ impl Deck {
                 }
             }
             DeckAction::LoopIn => self.loop_in = Some(self.quantized(self.target_position())),
-            DeckAction::LoopOut => self.loop_out(),
+            DeckAction::LoopOut => {
+                self.begin_slip();
+                self.loop_out();
+                // Nothing to return from if no loop started.
+                self.end_slip();
+            }
             DeckAction::AutoLoop { beats } => match self.loop_active {
-                true => self.loop_active = false,
-                false => self.auto_loop(beats as f64),
+                true => {
+                    self.loop_active = false;
+                    self.end_slip();
+                }
+                false => {
+                    self.begin_slip();
+                    self.auto_loop(beats as f64);
+                }
             },
             DeckAction::LoopHalve => self.resize_loop(0.5),
             DeckAction::LoopDouble => self.resize_loop(2.0),
@@ -601,6 +656,7 @@ impl Deck {
             }
             DeckAction::SoloStem(stem) => self.stems.solo(stem),
             DeckAction::ScratchStart => {
+                self.begin_slip();
                 self.pending_seek = None;
                 self.scratch = Some(self.position);
                 // Without key lock (or while silent) there is nothing to fade between.
@@ -619,6 +675,7 @@ impl Deck {
                 if !self.key_lock {
                     self.scratching = false;
                 }
+                self.end_slip();
             }
             DeckAction::SetTempo { .. }
             | DeckAction::SetTempoRange(_)
@@ -626,7 +683,11 @@ impl Deck {
             | DeckAction::SetKeyLock(_)
             | DeckAction::ToggleKeyLock
             | DeckAction::SetSyncLock(_)
-            | DeckAction::ToggleSyncLock => {}
+            | DeckAction::ToggleSyncLock
+            | DeckAction::SetSlipMode(_)
+            | DeckAction::ToggleSlipMode => {}
+            DeckAction::SetReverse(on) => self.set_reverse(on),
+            DeckAction::ToggleReverse => self.set_reverse(!self.heading_reverse()),
         }
     }
 
@@ -749,7 +810,10 @@ impl Deck {
             loop_region: self.loop_region,
             loop_active: self.loop_active,
             loop_in: self.loop_in,
-            slip_position: self.slip.map(|s| s.position),
+            slip_position: self.slip.map(|s| s.position).or(self.shadow),
+            slip_mode: self.slip_mode,
+            reverse: self.heading_reverse(),
+            rolling: self.slip.is_some(),
             stems: self.stems.snapshot(),
             scratching: self.scratch.is_some(),
             ..DeckSnapshot::default()
@@ -804,6 +868,9 @@ impl Deck {
             if let Some(on) = self.pending_key_lock.take() {
                 self.key_lock = on;
             }
+            if let Some(on) = self.pending_reverse.take() {
+                self.reverse = on;
+            }
             if switching_scratch {
                 self.scratching = self.scratch.is_some();
             }
@@ -823,10 +890,15 @@ impl Deck {
                 let lag = SCRATCH_SMOOTHING_SECONDS * self.sample_rate as f64;
                 ((target - self.position) / lag).clamp(-SCRATCH_MAX_RATE, SCRATCH_MAX_RATE)
             }
+            // Backwards at the tempo (no sync steering: there is no phase to follow).
+            _ if self.reverse => {
+                -((self.tempo_rate() + self.nudge).clamp(0.0, MAX_RATE as f32 - 0.01) as f64)
+            }
             _ => (self.tempo_rate() + self.nudge + self.phase_correction)
                 .clamp(0.0, MAX_RATE as f32 - 0.01) as f64,
         };
-        let advance = match self.key_lock && !self.scratching {
+        // The stretcher only reads forwards: reverse plays varispeed.
+        let advance = match self.key_lock && !self.scratching && !self.reverse {
             true => self.read_stretched(&mut left[..n], &mut right[..n], rate),
             false => self.read_varispeed(&mut left[..n], &mut right[..n], rate),
         };
@@ -840,10 +912,18 @@ impl Deck {
         if let Some(slip) = &mut self.slip {
             slip.position += advance;
         }
+        // In slip mode the track carries on at the tempo whatever the playhead does.
+        if self.transport == Transport::Playing {
+            let forward = n as f64 * self.forward_rate();
+            if let Some(shadow) = &mut self.shadow {
+                *shadow += forward;
+            }
+        }
 
         let target = match moving
             && self.pending_seek.is_none()
             && self.pending_key_lock.is_none()
+            && self.pending_reverse.is_none()
             && !(switching_scratch && self.key_lock)
         {
             true => 1.0,
@@ -861,6 +941,14 @@ impl Deck {
             self.peak = self.peak.max(l.abs()).max(r.abs());
         }
 
+        // Backwards into the start: stop there.
+        if self.reverse && !self.scratching && self.position <= 0.0 {
+            self.position = 0.0;
+            self.transport = Transport::Stopped;
+            self.pending_seek = None;
+            self.gain = 0.0;
+            self.shadow = None;
+        }
         if self.block_complete && !self.scratching && self.position >= self.block_len as f64 {
             self.transport = Transport::Stopped;
             self.position = self.block_len as f64;
@@ -896,6 +984,10 @@ impl Deck {
             if let Some(region) = active {
                 if before < region.end && self.position >= region.end {
                     self.position -= region.len();
+                }
+                // Backwards out of the start of the loop: round to its end.
+                if before >= region.start && self.position < region.start {
+                    self.position += region.len();
                 }
             }
         }
@@ -1084,7 +1176,13 @@ impl Deck {
                 }
                 let target = cue.position().unwrap_or(0.0);
                 match self.transport {
-                    Transport::Playing => self.jump_in_phase(target),
+                    Transport::Playing => {
+                        if self.slip_mode && self.slip_hot_cue.is_none() {
+                            self.begin_slip();
+                            self.slip_hot_cue = Some(slot);
+                        }
+                        self.jump_in_phase(target);
+                    }
                     Transport::Stopped | Transport::CuePreview => {
                         self.jump(target);
                         self.transport = Transport::CuePreview;
@@ -1142,11 +1240,13 @@ impl Deck {
     fn reloop_exit(&mut self) {
         if self.loop_active {
             self.loop_active = false;
+            self.end_slip();
             return;
         }
         let Some(region) = self.loop_region else {
             return;
         };
+        self.begin_slip();
         self.loop_active = true;
         if !region.contains(self.target_position()) {
             self.jump_in_phase(region.start);
@@ -1187,6 +1287,69 @@ impl Deck {
         if (target - self.target_position()).abs() > 1.0 {
             self.jump(target);
         }
+    }
+
+    fn set_slip_mode(&mut self, on: bool) {
+        self.slip_mode = on;
+        if !on {
+            // Turning slip off keeps the playhead where it is.
+            self.shadow = None;
+            self.slip_hot_cue = None;
+        }
+    }
+
+    /// In slip mode, while playing: start following where the track would be.
+    fn begin_slip(&mut self) {
+        if self.slip_mode && self.shadow.is_none() && self.transport == Transport::Playing {
+            self.shadow = Some(self.target_position());
+        }
+    }
+
+    /// If nothing holds the playhead away any more, rejoin the shadow.
+    fn end_slip(&mut self) {
+        let held = self.loop_active
+            || self.heading_reverse()
+            || self.scratch.is_some()
+            || self.slip_hot_cue.is_some();
+        if held {
+            return;
+        }
+        let Some(shadow) = self.shadow.take() else {
+            return;
+        };
+        // Where the shadow will be once the jump lands.
+        let target = shadow + self.jump_delay() * self.forward_rate();
+        let max = self.length().saturating_sub(1) as f64;
+        self.jump(target.clamp(0.0, max));
+    }
+
+    /// The direction the deck is playing, or about to once its fade ends.
+    fn heading_reverse(&self) -> bool {
+        self.pending_reverse.unwrap_or(self.reverse)
+    }
+
+    fn set_reverse(&mut self, on: bool) {
+        if on == self.heading_reverse() {
+            return;
+        }
+        if on {
+            self.begin_slip();
+        }
+        if self.gain == 0.0 {
+            self.reverse = on;
+            self.pending_reverse = None;
+            self.restart_stretcher = true;
+        } else {
+            self.pending_reverse = Some(on);
+        }
+        if !on {
+            self.end_slip();
+        }
+    }
+
+    /// Forward speed of the track: the tempo, bend and sync steering.
+    fn forward_rate(&self) -> f64 {
+        (self.tempo_rate() + self.nudge + self.phase_correction).max(0.0) as f64
     }
 
     fn set_key_lock(&mut self, on: bool) {
@@ -1765,6 +1928,122 @@ mod tests {
     }
 
     /// Positions seen while rendering `frames` in 128-frame pieces.
+    #[test]
+    fn reverse_plays_backwards_and_stops_at_the_start() {
+        for key_lock in [false, true] {
+            let mut deck = new_deck(key_lock);
+            deck.load(Some(ramp_track(200_000)));
+            deck.apply(DeckAction::SeekBy { seconds: 0.5 });
+            deck.apply(DeckAction::PlayPause);
+            run(&mut deck, 4_800);
+            let before = deck.snapshot().position;
+            deck.apply(DeckAction::ToggleReverse);
+            assert!(deck.snapshot().reverse);
+            let seen = positions(&mut deck, 9_600);
+            let after = *seen.last().unwrap();
+            // Fade out (a few ms of forward play), then backwards at normal speed.
+            assert!(after < before, "key lock {key_lock}: {before} -> {after}");
+            assert!(
+                (before as f64 - after as f64 - 9_600.0).abs() < 1_000.0,
+                "key lock {key_lock}: moved {}",
+                before as f64 - after as f64
+            );
+            // Audio goes backwards too: the ramp's samples fall.
+            let out = run(&mut deck, 256);
+            assert!(out[255].0 < out[0].0, "key lock {key_lock}");
+            run(&mut deck, 48_000);
+            let d = deck.snapshot();
+            assert_eq!(d.transport, Transport::Stopped, "stops at the start");
+            assert_eq!(d.position, 0);
+        }
+    }
+
+    /// Where the playhead is, compared with where it would be had nothing happened.
+    fn drift_from_timeline(deck: &mut Deck, started_at: u64, frames_since: usize) -> f64 {
+        deck.snapshot().position as f64 - (started_at as f64 + frames_since as f64)
+    }
+
+    #[test]
+    fn slip_mode_returns_after_a_loop() {
+        for key_lock in [false, true] {
+            let mut deck = new_deck(key_lock);
+            deck.load(Some(ramp_track(600_000)));
+            deck.apply(DeckAction::SetBeatGrid {
+                track: TrackId(7),
+                grid: Some(BeatGrid::from_bpm(120.0, 0.0, SR)),
+            });
+            deck.apply(DeckAction::SetSlipMode(true));
+            deck.apply(DeckAction::SeekBy { seconds: 1.0 });
+            deck.apply(DeckAction::PlayPause);
+            run(&mut deck, 1_024);
+            let start = deck.snapshot().position;
+            deck.apply(DeckAction::AutoLoop { beats: 1.0 });
+            run(&mut deck, 96_000);
+            assert!(deck.snapshot().slip_position.is_some());
+            deck.apply(DeckAction::AutoLoop { beats: 1.0 });
+            run(&mut deck, 4_864);
+            let drift = drift_from_timeline(&mut deck, start, 96_000 + 4_864);
+            assert!(drift.abs() < 300.0, "key lock {key_lock}: off by {drift}");
+            assert_eq!(deck.snapshot().slip_position, None);
+        }
+    }
+
+    #[test]
+    fn without_slip_a_loop_leaves_the_playhead_where_it_was() {
+        let mut deck = loaded(600_000);
+        deck.apply(DeckAction::SetBeatGrid {
+            track: TrackId(7),
+            grid: Some(BeatGrid::from_bpm(120.0, 0.0, SR)),
+        });
+        deck.apply(DeckAction::PlayPause);
+        run(&mut deck, 1_024);
+        let start = deck.snapshot().position;
+        deck.apply(DeckAction::AutoLoop { beats: 1.0 });
+        run(&mut deck, 96_000);
+        deck.apply(DeckAction::AutoLoop { beats: 1.0 });
+        run(&mut deck, 1_024);
+        assert!(deck.snapshot().position < start + 30_000);
+    }
+
+    #[test]
+    fn reverse_with_slip_is_a_censor() {
+        for key_lock in [false, true] {
+            let mut deck = new_deck(key_lock);
+            deck.load(Some(ramp_track(600_000)));
+            deck.apply(DeckAction::SetSlipMode(true));
+            deck.apply(DeckAction::SeekBy { seconds: 2.0 });
+            deck.apply(DeckAction::PlayPause);
+            run(&mut deck, 1_024);
+            let start = deck.snapshot().position;
+            deck.apply(DeckAction::SetReverse(true));
+            run(&mut deck, 24_064);
+            assert!(deck.snapshot().position < start, "went backwards");
+            deck.apply(DeckAction::SetReverse(false));
+            run(&mut deck, 4_864);
+            let drift = drift_from_timeline(&mut deck, start, 24_064 + 4_864);
+            assert!(drift.abs() < 300.0, "key lock {key_lock}: off by {drift}");
+        }
+    }
+
+    #[test]
+    fn slip_mode_returns_after_a_held_hot_cue() {
+        let mut deck = loaded(600_000);
+        deck.apply(DeckAction::SetSlipMode(true));
+        deck.apply(DeckAction::HotCuePress(0));
+        deck.apply(DeckAction::HotCueRelease(0));
+        deck.apply(DeckAction::SeekBy { seconds: 3.0 });
+        deck.apply(DeckAction::PlayPause);
+        run(&mut deck, 1_024);
+        let start = deck.snapshot().position;
+        deck.apply(DeckAction::HotCuePress(0));
+        run(&mut deck, 9_600);
+        assert!(deck.snapshot().position < 20_000, "playing from the cue");
+        deck.apply(DeckAction::HotCueRelease(0));
+        run(&mut deck, 1_024);
+        let drift = drift_from_timeline(&mut deck, start, 9_600 + 1_024);
+        assert!(drift.abs() < 300.0, "off by {drift}");
+    }
+
     fn positions(deck: &mut Deck, frames: usize) -> Vec<u64> {
         (0..frames / 128)
             .map(|_| {

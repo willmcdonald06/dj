@@ -11,12 +11,13 @@ use super::theme::*;
 use super::{Control, Slider, UiAction};
 
 /// Keyboard shortcuts, as shown by HELP: (keys, what they do).
-const SHORTCUTS: [(&str, &str); 30] = [
+const SHORTCUTS: [(&str, &str); 33] = [
     ("Space", "play / pause the selected deck"),
     ("C (hold)", "cue"),
     ("Tab", "select the other deck"),
     ("1 – 8", "hot cues (stem pads in STEMS mode)"),
     ("M", "pads: STEMS / HOT CUE"),
+    ("N", "pads: SAMPLER / HOT CUE"),
     ("I / O", "loop in / out"),
     ("L", "4-beat loop"),
     ("[ / ]", "halve / double the loop"),
@@ -28,6 +29,8 @@ const SHORTCUTS: [(&str, &str); 30] = [
     ("S", "sync on / off"),
     ("K", "key lock"),
     ("Q", "quantize"),
+    ("J", "slip mode"),
+    ("D", "reverse"),
     ("P", "headphone cue"),
     ("E", "eject"),
     ("+ / −", "zoom the waveforms"),

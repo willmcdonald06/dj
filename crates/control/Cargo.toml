@@ -12,6 +12,8 @@ dj-engine.workspace = true
 midir.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 midir.workspace = true

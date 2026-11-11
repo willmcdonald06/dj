@@ -6,14 +6,34 @@ use std::path::{Path, PathBuf};
 
 use dj_analysis::KeyNotation;
 use dj_audio_io::AudioSettings;
-use dj_engine::{OutputMode, TempoRange};
+use dj_engine::{OutputMode, SAMPLER_DEFAULT_LEVEL, SAMPLER_SLOTS, SampleMode, TempoRange};
 use dj_ui::WaveformStyle;
 use serde::Deserialize;
 
 /// Buffer sizes offered on the settings screen, in frames.
 pub const BUFFER_CHOICES: [u32; 6] = [64, 128, 256, 512, 1024, 2048];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The sampler bank, kept so it comes back after a restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplerBank {
+    pub paths: [Option<PathBuf>; SAMPLER_SLOTS],
+    pub modes: [SampleMode; SAMPLER_SLOTS],
+    pub level: f32,
+    pub sync: bool,
+}
+
+impl Default for SamplerBank {
+    fn default() -> Self {
+        Self {
+            paths: Default::default(),
+            modes: [SampleMode::OneShot; SAMPLER_SLOTS],
+            level: SAMPLER_DEFAULT_LEVEL,
+            sync: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// How keys are written: Open Key (default), Camelot or musical names.
     pub key_notation: KeyNotation,
@@ -29,6 +49,7 @@ pub struct Settings {
     pub tempo_range: TempoRange,
     /// Whether key lock is on when the app starts.
     pub key_lock: bool,
+    pub sampler: SamplerBank,
 }
 
 impl Default for Settings {
@@ -43,6 +64,7 @@ impl Default for Settings {
             output_mode: OutputMode::InternalMix,
             tempo_range: TempoRange::default(),
             key_lock: true,
+            sampler: SamplerBank::default(),
         }
     }
 }
@@ -179,7 +201,14 @@ impl Settings {
              # \"open\", \"camelot\" or \"musical\".\n\
              key_notation = \"{notation}\"\n\
              # \"spectrum\" or \"bands\".\n\
-             waveform = \"{waveform}\"\n",
+             waveform = \"{waveform}\"\n\
+             \n\
+             [sampler]\n\
+             # One file per slot (\"\" for empty), and one-shot, gate or loop.\n\
+             slots = [{slots}]\n\
+             modes = [{modes}]\n\
+             level = {level:.2}\n\
+             sync = {sync}\n",
             buffer = self.buffer_frames.unwrap_or(0),
             rate = self.sample_rate,
             output = output_mode_name(self.output_mode),
@@ -187,6 +216,26 @@ impl Settings {
             key_lock = self.key_lock,
             notation = key_notation_name(self.key_notation),
             waveform = waveform_style_name(self.waveform),
+            slots = self
+                .sampler
+                .paths
+                .iter()
+                .map(|p| toml_string(
+                    &p.as_ref()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+            modes = self
+                .sampler
+                .modes
+                .iter()
+                .map(|m| format!("\"{}\"", sample_mode_name(*m)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            level = self.sampler.level,
+            sync = self.sampler.sync,
         )
     }
 }
@@ -198,6 +247,16 @@ struct File {
     audio: AudioFile,
     decks: DecksFile,
     display: DisplayFile,
+    sampler: SamplerFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SamplerFile {
+    slots: Vec<String>,
+    modes: Vec<String>,
+    level: Option<f32>,
+    sync: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -267,7 +326,41 @@ impl File {
                 None => problems.push(format!("waveform = {name:?} isn't known")),
             }
         }
+        for (slot, path) in s.sampler.paths.iter_mut().zip(&self.sampler.slots) {
+            if !path.is_empty() {
+                *slot = Some(PathBuf::from(path));
+            }
+        }
+        for (slot, name) in s.sampler.modes.iter_mut().zip(&self.sampler.modes) {
+            match parse_sample_mode(name) {
+                Some(mode) => *slot = mode,
+                None => problems.push(format!("sampler mode {name:?} isn't known")),
+            }
+        }
+        if let Some(level) = self.sampler.level {
+            s.sampler.level = level.clamp(0.0, 1.0);
+        }
+        if let Some(sync) = self.sampler.sync {
+            s.sampler.sync = sync;
+        }
         (s, problems)
+    }
+}
+
+fn parse_sample_mode(value: &str) -> Option<SampleMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "one-shot" | "oneshot" => Some(SampleMode::OneShot),
+        "gate" | "gated" => Some(SampleMode::Gated),
+        "loop" => Some(SampleMode::Loop),
+        _ => None,
+    }
+}
+
+fn sample_mode_name(mode: SampleMode) -> &'static str {
+    match mode {
+        SampleMode::OneShot => "one-shot",
+        SampleMode::Gated => "gate",
+        SampleMode::Loop => "loop",
     }
 }
 
@@ -394,6 +487,19 @@ mod tests {
             output_mode: OutputMode::PerDeck,
             tempo_range: TempoRange::Percent16,
             key_lock: false,
+            sampler: SamplerBank {
+                paths: std::array::from_fn(|i| match i {
+                    2 => Some(PathBuf::from("/music/air horn.wav")),
+                    _ => None,
+                }),
+                modes: std::array::from_fn(|i| match i {
+                    2 => SampleMode::Loop,
+                    5 => SampleMode::Gated,
+                    _ => SampleMode::OneShot,
+                }),
+                level: 0.5,
+                sync: false,
+            },
         };
         settings.save(&path).unwrap();
         assert_eq!(Settings::load(&path), settings);
