@@ -39,11 +39,25 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse(std::env::args().skip(1))?;
+    lock_memory();
     let files = SettingsFiles::load(&cli);
 
     match cli.mode {
         Mode::Help => {
             cli::print_help();
+            Ok(())
+        }
+        Mode::WriteTheme { ref name } => {
+            let base = match frontend::theme::Theme::built_in(&files.settings.theme) {
+                Some(_) => files.settings.theme.as_str(),
+                None => "dark",
+            };
+            let path = frontend::theme::write_new(name, base, &themes_folder(&files.path))
+                .map_err(anyhow::Error::msg)?;
+            tracing::info!(
+                "wrote {}: edit it, and pick \"{name}\" in the settings (or run with --theme {name})",
+                path.display()
+            );
             Ok(())
         }
         Mode::ListDevices => {
@@ -73,6 +87,7 @@ fn main() -> anyhow::Result<()> {
             millis,
             ref keys,
             size: (width, height, scale),
+            drag,
         } => {
             let (mut frontend, controller) = build_frontend(&cli, &files)?;
             let size = dj_ui::FrameSize {
@@ -86,6 +101,7 @@ fn main() -> anyhow::Result<()> {
                 Duration::from_millis(millis),
                 keys,
                 size,
+                drag,
             )?;
             drop(controller);
             Ok(())
@@ -111,6 +127,42 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Keep the app's memory in RAM, so the audio thread never waits for a page to come
+/// back from swap or disk (the code it runs included). Only when the system allows
+/// locking far more than the app needs (`ulimit -l`, or `LimitMEMLOCK` in a systemd
+/// unit): with a small limit, locking new allocations would make them fail. Pages are
+/// locked as they are first used, not all at once.
+fn lock_memory() {
+    #[cfg(target_os = "linux")]
+    {
+        /// Enough for two long tracks, stems, the sampler and the UI.
+        const NEEDED: u64 = 1 << 30;
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes only into `limit`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+            return;
+        }
+        let enough = limit.rlim_cur == libc::RLIM_INFINITY || limit.rlim_cur >= NEEDED;
+        if !enough {
+            tracing::info!(
+                "memory not locked (the limit is {} kB; fine on a desktop, set \
+                 LimitMEMLOCK=infinity on the DJ unit)",
+                limit.rlim_cur / 1024
+            );
+            return;
+        }
+        // SAFETY: mlockall takes only flags.
+        let flags = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
+        match unsafe { libc::mlockall(flags) } {
+            0 => tracing::info!("memory locked: the app is never swapped out"),
+            _ => tracing::warn!("couldn't lock memory: {}", std::io::Error::last_os_error()),
+        }
+    }
+}
+
 /// Drive the frontend at 60 fps without a window for `duration`, then render its scene
 /// offscreen at the target panel size and save it as a PNG.
 fn screenshot(
@@ -119,12 +171,15 @@ fn screenshot(
     duration: Duration,
     keys: &str,
     size: dj_ui::FrameSize,
+    drag: Option<((i32, i32), (i32, i32))>,
 ) -> anyhow::Result<()> {
     use dj_ui::{Delegate as _, Input, Key};
     let mut offscreen = dj_ui::Offscreen::new().context("starting offscreen rendering")?;
     let started = std::time::Instant::now();
     let deadline = started + duration;
     let mut typed = keys.is_empty();
+    let mut dragged = drag.is_none();
+    let mut released = drag.is_none();
     // Render every frame, as the window would, so caches behave the same.
     let pixels = loop {
         if !typed && started.elapsed() >= duration / 2 {
@@ -133,10 +188,34 @@ fn screenshot(
                 let key = match c {
                     '\t' => Key::Tab,
                     ' ' => Key::Space,
+                    '\n' => Key::Enter,
+                    '←' => Key::Left,
+                    '→' => Key::Right,
+                    '↑' => Key::Up,
+                    '↓' => Key::Down,
                     c => Key::Char(c),
                 };
                 frontend.on_input(Input::KeyDown { key, repeat: false });
                 frontend.on_input(Input::KeyUp { key });
+            }
+        }
+        if typed && !dragged && started.elapsed() >= duration / 2 {
+            dragged = true;
+            if let Some(((x1, y1), (x2, y2))) = drag {
+                let (x1, y1, x2, y2) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32);
+                frontend.on_input(Input::PointerDown { x: x1, y: y1 });
+                for step in 1..=10 {
+                    let t = step as f32 / 10.0;
+                    let (x, y) = (x1 + (x2 - x1) * t, y1 + (y2 - y1) * t);
+                    frontend.on_input(Input::PointerMove { x, y });
+                }
+            }
+        }
+        if dragged && !released && started.elapsed() >= duration * 3 / 4 {
+            released = true;
+            if let Some((_, (x, y))) = drag {
+                let (x, y) = (x as f32, y as f32);
+                frontend.on_input(Input::PointerUp { x, y });
             }
         }
         let scene = frontend.scene(size);
@@ -261,6 +340,14 @@ fn control_settings(cli: &Cli) -> dj_control::ControlSettings {
     }
 }
 
+/// Theme files live in `themes`, next to the settings file.
+pub(crate) fn themes_folder(settings: &std::path::Path) -> std::path::PathBuf {
+    settings
+        .parent()
+        .map(|folder| folder.join("themes"))
+        .unwrap_or_else(|| std::path::PathBuf::from("themes"))
+}
+
 /// Where recordings go: --recordings, else a Recordings folder in the first music
 /// folder (~/Music), else in the home folder.
 fn recordings_folder(cli: &Cli) -> std::path::PathBuf {
@@ -346,6 +433,9 @@ fn start(cli: &Cli, settings: &Settings) -> anyhow::Result<Running> {
         ),
     };
     let mut handle = handle;
+    handle
+        .send(Command::SetQuantize(settings.quantize))
+        .context("setting quantize")?;
     for deck in DeckId::ALL {
         let range = DeckAction::SetTempoRange(settings.tempo_range);
         handle

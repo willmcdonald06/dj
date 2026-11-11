@@ -2,7 +2,7 @@
 
 use dj_audio_io::{HISTOGRAM_BUCKETS, StatsSnapshot};
 use dj_engine::{DeckId, FxControl, FxSnapshot, FxTarget};
-use dj_ui::{Align, Color, Rect};
+use dj_ui::{Align, Rect};
 
 use super::deck_view::beats_label;
 use super::layout::{Area, Layout};
@@ -38,7 +38,7 @@ const SHORTCUTS: [(&str, &str); 33] = [
     ("G", "next effect"),
     ("Z / X", "FX length shorter / longer"),
     ("V", "tap the FX tempo"),
-    ("B", "browser keys: ↑/↓ select, Enter load"),
+    ("B", "browser keys: ↑/↓ select, ←/→ views, Enter load"),
     ("/", "search the browser"),
     ("Esc", "leave the browser or search"),
     ("W", "record the main output on / off"),
@@ -61,7 +61,9 @@ pub struct TopBar<'a> {
 
 impl Painter {
     pub fn top_bar(&mut self, area: Area, v: TopBar<'_>) {
-        self.push(Rect::new(area.x, area.y, area.width, area.height, PANEL_TOP).gradient(PANEL));
+        self.push(
+            Rect::new(area.x, area.y, area.width, area.height, th().panel_top).gradient(th().panel),
+        );
         self.fill(
             Area::new(
                 area.x,
@@ -69,7 +71,7 @@ impl Painter {
                 area.width,
                 self.px(1.0),
             ),
-            LINE,
+            th().line,
         );
         let inner = Area::new(
             area.x + self.px(12.0),
@@ -80,7 +82,7 @@ impl Painter {
 
         // Left: the name, then audio health.
         let (name, rest) = inner.split_left(self.px(30.0), self.px(12.0));
-        self.bold(name, "dj", 15.0, TEXT, Align::Left);
+        self.bold(name, "dj", 15.0, th().text, Align::Left);
         let (health, rest) = rest.split_left(self.px(118.0), self.px(10.0));
         self.audio_health(health, v.stats);
         // REC lights up and shows how long it has been recording.
@@ -89,7 +91,13 @@ impl Painter {
             Some(seconds) => crate::recorder::clock(seconds),
             None => "REC".to_string(),
         };
-        self.button(rec, &label, v.recording.is_some(), DANGER, UiAction::Record);
+        self.button(
+            rec,
+            &label,
+            v.recording.is_some(),
+            th().danger,
+            UiAction::Record,
+        );
 
         // Right: settings, help, zoom, quantize.
         let gap = self.px(6.0);
@@ -98,25 +106,31 @@ impl Painter {
             settings,
             super::painter::Icon::Settings,
             false,
-            TEXT,
+            th().text,
             UiAction::Settings(super::settings_view::SettingsAction::Open),
         );
         let (help, rest) = rest.split_right(self.px(26.0), gap * 2.0);
-        self.button(help, "?", v.help, TEXT, UiAction::Help);
+        self.button(help, "?", v.help, th().text, UiAction::Help);
         let (zoom_in, rest) = rest.split_right(self.px(28.0), gap);
-        self.button(zoom_in, "+", false, TEXT, UiAction::Zoom(1.0 / 1.25));
+        self.button(zoom_in, "+", false, th().text, UiAction::Zoom(1.0 / 1.25));
         let (zoom_label, rest) = rest.split_right(self.px(40.0), gap);
         self.label(
             zoom_label,
             format!("{:.1} s", v.zoom_seconds),
             11.0,
-            SOFT_TEXT,
+            th().soft_text,
             Align::Center,
         );
         let (zoom_out, rest) = rest.split_right(self.px(28.0), gap * 2.0);
-        self.button(zoom_out, "−", false, TEXT, UiAction::Zoom(1.25));
+        self.button(zoom_out, "−", false, th().text, UiAction::Zoom(1.25));
         let (quantize, rest) = rest.split_right(self.px(86.0), gap);
-        self.button(quantize, "QUANTIZE", v.quantize, CUE, UiAction::Quantize);
+        self.button(
+            quantize,
+            "QUANTIZE",
+            v.quantize,
+            th().cue,
+            UiAction::Quantize,
+        );
 
         // Centre: the phase meter, with the beat FX either side.
         let w = self.px(240.0);
@@ -136,8 +150,8 @@ impl Painter {
         let gap = self.px(4.0);
         let step = self.px(20.0);
         let fx_color = match fx.kind.has_tail() {
-            true => Color::rgb(0.3, 0.6, 1.0),
-            false => FILTER,
+            true => th().echo,
+            false => th().filter,
         };
         let needed = self.px(44.0 + 20.0 * 4.0 + 66.0 + 36.0) + gap * 7.0;
         if left.width >= needed {
@@ -148,7 +162,7 @@ impl Painter {
                 prev,
                 super::painter::Icon::Left,
                 false,
-                TEXT,
+                th().text,
                 UiAction::Fx(FxControl::StepKind(-1)),
             );
             let (kind, rest) = rest.split_left(self.px(66.0), gap);
@@ -160,7 +174,7 @@ impl Painter {
                 next,
                 super::painter::Icon::Right,
                 false,
-                TEXT,
+                th().text,
                 UiAction::Fx(FxControl::StepKind(1)),
             );
             let (shorter, rest) = rest.split_left(step, gap);
@@ -168,17 +182,17 @@ impl Painter {
                 shorter,
                 super::painter::Icon::Left,
                 false,
-                TEXT,
+                th().text,
                 UiAction::Fx(FxControl::StepBeats(-1)),
             );
             let (beats, rest) = rest.split_left(self.px(36.0), gap);
-            self.label(beats, beats_label(fx.beats), 11.0, TEXT, Align::Center);
+            self.label(beats, beats_label(fx.beats), 11.0, th().text, Align::Center);
             let (longer, _) = rest.split_left(step, gap);
             self.icon_button(
                 longer,
                 super::painter::Icon::Right,
                 false,
-                TEXT,
+                th().text,
                 UiAction::Fx(FxControl::StepBeats(1)),
             );
         }
@@ -187,9 +201,9 @@ impl Painter {
         if right.width >= needed {
             let mut rest = right;
             let targets = [
-                ("A", FxTarget::Deck(DeckId::A), DECK_COLORS[0]),
-                ("B", FxTarget::Deck(DeckId::B), DECK_COLORS[1]),
-                ("MAIN", FxTarget::Main, TEXT),
+                ("A", FxTarget::Deck(DeckId::A), th().decks[0]),
+                ("B", FxTarget::Deck(DeckId::B), th().decks[1]),
+                ("MAIN", FxTarget::Main, th().text),
             ];
             for (label, target, color) in targets {
                 let w = match target {
@@ -211,11 +225,17 @@ impl Painter {
             // TAP shows the FX tempo; once tapped, a click on the tempo goes back to
             // following the decks.
             let (tap, rest) = rest.split_left(self.px(36.0), gap);
-            self.button(tap, "TAP", fx.tapped, CUE, UiAction::Fx(FxControl::Tap));
+            self.button(
+                tap,
+                "TAP",
+                fx.tapped,
+                th().cue,
+                UiAction::Fx(FxControl::Tap),
+            );
             let (bpm, _) = rest.split_left(self.px(28.0), 0.0);
             let ink = match fx.tapped {
-                true => CUE,
-                false => SOFT_TEXT,
+                true => th().cue,
+                false => th().soft_text,
             };
             self.label(bpm, format!("{:.0}", fx.bpm), 10.0, ink, Align::Left);
             if fx.tapped {
@@ -233,9 +253,9 @@ impl Painter {
             let fraction = ((count as f32 + 1.0).ln() / (max_count as f32 + 1.0).ln()).min(1.0);
             let h = (area.height - self.px(4.0)) * fraction;
             let color = match i {
-                10 => DANGER,
-                7..=9 => WARNING,
-                _ => Color::rgb(0.25, 0.32, 0.45),
+                10 => th().danger,
+                7..=9 => th().warning,
+                _ => th().histogram,
             };
             self.fill(
                 Area::new(
@@ -249,9 +269,9 @@ impl Painter {
         }
         let x = area.x + HISTOGRAM_BUCKETS as f32 * (bar_w + gap) + self.px(8.0);
         let (text, color) = match stats.xruns {
-            0 => ("audio ok".to_string(), SOFT_TEXT),
-            1 => ("1 dropout".to_string(), DANGER),
-            n => (format!("{n} dropouts"), DANGER),
+            0 => ("audio ok".to_string(), th().soft_text),
+            1 => ("1 dropout".to_string(), th().danger),
+            n => (format!("{n} dropouts"), th().danger),
         };
         self.label(
             Area::new(x, area.y, area.right() - x, area.height),
@@ -274,27 +294,27 @@ impl Painter {
                 h,
             );
             p.push(
-                Rect::new(
-                    area.x,
-                    area.y,
-                    area.width,
-                    area.height,
-                    Color::rgb(0.07, 0.07, 0.085),
-                )
-                .gradient(Color::rgb(0.045, 0.045, 0.055))
-                .rounded(p.px(6.0)),
+                Rect::new(area.x, area.y, area.width, area.height, th().popup)
+                    .gradient(th().popup_bottom)
+                    .rounded(p.px(6.0)),
             );
             p.push(
-                Rect::new(area.x, area.y, area.width, area.height, LINE)
+                Rect::new(area.x, area.y, area.width, area.height, th().line)
                     .rounded(p.px(6.0))
                     .stroke(p.px(1.0)),
             );
             p.rounded(
                 Area::new(area.x, area.y, p.px(4.0), area.height),
                 p.px(2.0),
-                WARNING,
+                th().warning,
             );
-            p.label(area.inset_x(p.px(16.0)), message, 12.0, TEXT, Align::Left);
+            p.label(
+                area.inset_x(p.px(16.0)),
+                message,
+                12.0,
+                th().text,
+                Align::Left,
+            );
         });
     }
 
@@ -302,31 +322,25 @@ impl Painter {
     pub fn help(&mut self, layout: &Layout) {
         self.popup(|p| {
             let screen = Area::new(0.0, 0.0, layout.width, layout.height);
-            p.fill(screen, Color::rgba(0.0, 0.0, 0.0, 0.7));
+            p.fill(screen, th().scrim);
             let row_h = p.px(22.0);
             let rows = SHORTCUTS.len().div_ceil(2);
             let w = p.px(760.0).min(layout.width - p.px(32.0));
             let h = row_h * rows as f32 + p.px(80.0);
             let panel = Area::new((layout.width - w) / 2.0, (layout.height - h) / 2.0, w, h);
             p.push(
-                Rect::new(
-                    panel.x,
-                    panel.y,
-                    panel.width,
-                    panel.height,
-                    Color::rgb(0.05, 0.05, 0.06),
-                )
-                .gradient(Color::rgb(0.03, 0.03, 0.037))
-                .rounded(p.px(8.0)),
+                Rect::new(panel.x, panel.y, panel.width, panel.height, th().popup)
+                    .gradient(th().popup_bottom)
+                    .rounded(p.px(8.0)),
             );
             let inner = panel.inset(p.px(20.0));
             let (title, list) = inner.split_top(p.px(24.0), p.px(12.0));
-            p.bold(title, "Keyboard", 16.0, TEXT, Align::Left);
+            p.bold(title, "Keyboard", 16.0, th().text, Align::Left);
             p.label(
                 title,
                 "Everything here is also a button. Click anywhere to close.",
                 11.0,
-                SOFT_TEXT,
+                th().soft_text,
                 Align::Right,
             );
             for (column, area) in list.columns(2, p.px(24.0)).enumerate() {
@@ -334,8 +348,8 @@ impl Painter {
                 {
                     let row = Area::new(area.x, area.y + i as f32 * row_h, area.width, row_h);
                     let (key_area, text) = row.split_left(p.px(116.0), p.px(10.0));
-                    p.bold(key_area, *keys, 11.0, CUE, Align::Right);
-                    p.label(text, *what, 12.0, TEXT, Align::Left);
+                    p.bold(key_area, *keys, 11.0, th().cue, Align::Right);
+                    p.label(text, *what, 12.0, th().text, Align::Left);
                 }
             }
             p.hit(screen, Control::Button(UiAction::Help));

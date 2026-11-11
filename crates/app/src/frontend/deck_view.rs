@@ -76,7 +76,7 @@ impl Painter {
     }
 
     fn deck_header(&mut self, v: &DeckView<'_>, area: Area) {
-        let color = DECK_COLORS[v.deck.index()];
+        let color = th().decks[v.deck.index()];
         let d = v.d;
         // Deck letter: filled when this deck takes the keyboard.
         let (tile, rest) = area.split_left(area.height, self.px(10.0));
@@ -110,12 +110,12 @@ impl Painter {
         let (top, bottom) = time.split_top(time.height * 0.62, 0.0);
         if d.track.is_some() {
             let remaining = clock(d.length.saturating_sub(d.position), v.sample_rate);
-            self.bold(top, format!("-{remaining}"), big, TEXT, Align::Right);
+            self.bold(top, format!("-{remaining}"), big, th().text, Align::Right);
             self.label(
                 bottom,
                 clock(d.position, v.sample_rate),
                 small,
-                SOFT_TEXT,
+                th().soft_text,
                 Align::Right,
             );
         }
@@ -132,7 +132,7 @@ impl Painter {
         };
         let bpm_color = match d.sync_master {
             true => color,
-            false => TEXT,
+            false => th().text,
         };
         if d.track.is_some() {
             self.bold(top, bpm_text, big, bpm_color, Align::Right);
@@ -147,7 +147,7 @@ impl Painter {
             bottom,
             format!("{tempo:+.2}%  ±{range}"),
             small,
-            SOFT_TEXT,
+            th().soft_text,
             Align::Right,
         );
 
@@ -165,7 +165,7 @@ impl Painter {
                         chip.y - self.px(2.0),
                         chip.width + self.px(4.0),
                         chip.height + self.px(4.0),
-                        PLAY,
+                        th().play,
                     )
                     .rounded(self.px(5.0))
                     .stroke(self.px(1.5)),
@@ -189,35 +189,35 @@ impl Painter {
                 (0, false) => String::new(),
                 (shift, false) => format!("{shift:+}"),
             };
-            self.label(below, note, 8.5, SOFT_TEXT, Align::Center);
+            self.label(below, note, 8.5, th().soft_text, Align::Center);
         }
 
         // Title over artist.
         let (top, bottom) = title.split_top(title.height * 0.55, 0.0);
         match (d.track, v.info) {
-            (None, _) => self.label(top, "No track", 14.0, DIM_TEXT, Align::Left),
-            (Some(_), None) => self.label(top, "Loading…", 14.0, SOFT_TEXT, Align::Left),
+            (None, _) => self.label(top, "No track", 14.0, th().dim_text, Align::Left),
+            (Some(_), None) => self.label(top, "Loading…", 14.0, th().soft_text, Align::Left),
             (Some(_), Some(info)) => {
-                self.bold(top, info.title.clone(), 14.0, TEXT, Align::Left);
+                self.bold(top, info.title.clone(), 14.0, th().text, Align::Left);
                 if let Some(artist) = &info.artist {
-                    self.label(bottom, artist.clone(), 11.0, SOFT_TEXT, Align::Left);
+                    self.label(bottom, artist.clone(), 11.0, th().soft_text, Align::Left);
                 }
             }
         }
     }
 
-    /// CUE, PLAY, SYNC, KEY LOCK; then nudge and fine tempo steps.
+    /// th().cue, th().play, SYNC, KEY LOCK; then nudge and fine tempo steps.
     fn transport_row(&mut self, v: &DeckView<'_>, area: Area) {
         let d = v.d;
         let deck = v.deck;
-        let color = DECK_COLORS[deck.index()];
+        let color = th().decks[deck.index()];
         let gap = self.px(6.0);
         let playing = d.transport.is_moving();
         let cue_lit = d.track.is_some()
             && (d.transport == Transport::CuePreview || (!playing && d.position == d.cue));
         let big = self.px(60.0);
         let (cue, rest) = area.split_left(big, gap);
-        self.button(cue, "CUE", cue_lit, CUE, UiAction::Cue(deck));
+        self.button(cue, "CUE", cue_lit, th().cue, UiAction::Cue(deck));
         let (play, rest) = rest.split_left(big, gap * 2.0);
         let icon = match playing {
             true => Icon::Pause,
@@ -227,7 +227,7 @@ impl Painter {
             play,
             icon,
             playing,
-            PLAY,
+            th().play,
             UiAction::Deck(deck, DeckAction::PlayPause),
         );
 
@@ -244,7 +244,7 @@ impl Painter {
             key,
             "KEY",
             d.key_lock,
-            KEY_LOCK,
+            th().key_lock,
             UiAction::Deck(deck, DeckAction::ToggleKeyLock),
         );
 
@@ -256,21 +256,27 @@ impl Painter {
                 slow,
                 Icon::Left,
                 false,
-                TEXT,
+                th().text,
                 UiAction::Nudge(deck, -KEY_NUDGE),
             );
             self.icon_button(
                 fast,
                 Icon::Right,
                 false,
-                TEXT,
+                th().text,
                 UiAction::Nudge(deck, KEY_NUDGE),
             );
         }
         let mut steps = tempo.columns(2, gap);
         if let (Some(down), Some(up)) = (steps.next(), steps.next()) {
-            self.button(down, "−", false, TEXT, UiAction::Tempo(deck, -TEMPO_FINE));
-            self.button(up, "+", false, TEXT, UiAction::Tempo(deck, TEMPO_FINE));
+            self.button(
+                down,
+                "−",
+                false,
+                th().text,
+                UiAction::Tempo(deck, -TEMPO_FINE),
+            );
+            self.button(up, "+", false, th().text, UiAction::Tempo(deck, TEMPO_FINE));
         }
     }
 
@@ -286,14 +292,14 @@ impl Painter {
                 loop_in,
                 "IN",
                 d.loop_in.is_some(),
-                LOOP,
+                th().loops,
                 UiAction::Deck(deck, DeckAction::LoopIn),
             );
             self.button(
                 loop_out,
                 "OUT",
                 false,
-                LOOP,
+                th().loops,
                 UiAction::Deck(deck, DeckAction::LoopOut),
             );
         }
@@ -303,7 +309,7 @@ impl Painter {
             reverse,
             "REV",
             d.reverse,
-            WARNING,
+            th().warning,
             UiAction::Deck(deck, DeckAction::ToggleReverse),
         );
         let (slip, rest) = rest.split_right(self.px(44.0), gap);
@@ -311,7 +317,7 @@ impl Painter {
             slip,
             "SLIP",
             d.slip_mode,
-            FILTER,
+            th().filter,
             UiAction::Deck(deck, DeckAction::ToggleSlipMode),
         );
         let (reloop, rest) = rest.split_right(self.px(64.0), gap);
@@ -319,7 +325,7 @@ impl Painter {
             reloop,
             "RELOOP",
             false,
-            LOOP,
+            th().loops,
             UiAction::Deck(deck, DeckAction::ReloopExit),
         );
         let step = self.px(30.0);
@@ -329,14 +335,14 @@ impl Painter {
             halve,
             Icon::Left,
             false,
-            TEXT,
+            th().text,
             UiAction::LoopSize(deck, 0.5),
         );
         self.icon_button(
             double,
             Icon::Right,
             false,
-            TEXT,
+            th().text,
             UiAction::LoopSize(deck, 2.0),
         );
         let beats = match d.loop_active {
@@ -348,11 +354,17 @@ impl Painter {
             false => v.loop_beats,
         };
         let label = format!("LOOP  {}", beats_label(beats));
-        self.button(size, &label, d.loop_active, LOOP, UiAction::AutoLoop(deck));
+        self.button(
+            size,
+            &label,
+            d.loop_active,
+            th().loops,
+            UiAction::AutoLoop(deck),
+        );
     }
 
     fn pad_tabs(&mut self, v: &DeckView<'_>, area: Area) {
-        let color = DECK_COLORS[v.deck.index()];
+        let color = th().decks[v.deck.index()];
         let modes = [
             ("HOT CUE", PadMode::HotCue),
             ("ROLL", PadMode::Roll),
@@ -368,8 +380,8 @@ impl Painter {
             let tab = Area::new(x, area.y, tab_w, area.height);
             let active = v.pads.mode == mode;
             let ink = match active {
-                true => TEXT,
-                false => SOFT_TEXT,
+                true => th().text,
+                false => th().soft_text,
             };
             self.bold(tab, label, 9.0, ink, Align::Left);
             if active {
@@ -398,7 +410,7 @@ impl Painter {
                 delete,
                 label,
                 v.pads.delete_armed,
-                DANGER,
+                th().danger,
                 UiAction::DeleteArm(v.deck),
             );
         }
@@ -414,20 +426,20 @@ impl Painter {
             .as_deref()
             .filter(|_| slot.sample.is_some())
         else {
-            self.tinted_button(pad, "", false, DIM_TEXT, action);
+            self.tinted_button(pad, "", false, th().dim_text, action);
             let caption = Area::new(
                 pad.x,
                 pad.bottom() - self.px(15.0),
                 pad.width,
                 self.px(11.0),
             );
-            self.label(caption, "LOAD", 7.0, DIM_TEXT, Align::Center);
+            self.label(caption, "LOAD", 7.0, th().dim_text, Align::Center);
             return;
         };
         let color = match slot.mode {
-            SampleMode::OneShot => CUE,
-            SampleMode::Gated => FILTER,
-            SampleMode::Loop => LOOP,
+            SampleMode::OneShot => th().cue,
+            SampleMode::Gated => th().filter,
+            SampleMode::Loop => th().loops,
         };
         let lit = slot.playing || slot.waiting;
         // The tinted button draws the body; the name goes on top, smaller, so more of it
@@ -454,7 +466,7 @@ impl Painter {
         );
         let soft = match lit {
             true => ink,
-            false => SOFT_TEXT,
+            false => th().soft_text,
         };
         let mode = match slot.waiting {
             true => "WAIT",
@@ -491,7 +503,7 @@ impl Painter {
             delete,
             label,
             v.pads.delete_armed,
-            DANGER,
+            th().danger,
             UiAction::DeleteArm(v.deck),
         );
         let (mode, rest) = rest.split_right(self.px(42.0), gap);
@@ -503,13 +515,19 @@ impl Painter {
             mode,
             label,
             v.pads.mode_armed,
-            CUE,
+            th().cue,
             UiAction::SamplerModeArm(v.deck),
         );
         let (sync, rest) = rest.split_right(self.px(36.0), gap);
-        self.button(sync, "SYNC", v.sampler.sync, PLAY, UiAction::SamplerSync);
+        self.button(
+            sync,
+            "SYNC",
+            v.sampler.sync,
+            th().play,
+            UiAction::SamplerSync,
+        );
         let (level, _) = rest.split_right(self.px(18.0), 0.0);
-        self.small_knob(level, v.sampler.level, TEXT, Slider::SamplerLevel);
+        self.small_knob(level, v.sampler.level, th().text, Slider::SamplerLevel);
     }
 
     /// One small chip per stem at the right of `area` (left of `min_x` is taken):
@@ -535,7 +553,7 @@ impl Painter {
                 cell,
                 letter,
                 playing,
-                STEM_COLORS[stem.index()],
+                th().stems[stem.index()],
                 UiAction::Deck(v.deck, DeckAction::ToggleStem(stem)),
             );
             x += chip + gap;
@@ -557,7 +575,7 @@ impl Painter {
                         pad,
                         &label,
                         cue.is_set(),
-                        HOT_CUE_COLORS[i],
+                        th().hot_cues[i],
                         UiAction::HotCue(deck, i),
                     );
                 }
@@ -569,7 +587,7 @@ impl Painter {
                                 ((r.len() / g.period) as f32 - beats).abs() < 0.001
                             })
                         });
-                    self.button(pad, label, on, LOOP, UiAction::Roll(deck, beats));
+                    self.button(pad, label, on, th().loops, UiAction::Roll(deck, beats));
                 }
                 PadMode::Jump => {
                     let (label, beats) = JUMP_PADS[i];
@@ -577,15 +595,15 @@ impl Painter {
                         pad,
                         label,
                         false,
-                        TEXT,
+                        th().text,
                         UiAction::Deck(deck, DeckAction::BeatJump { beats }),
                     );
                 }
                 PadMode::Grid => {
                     let (label, edit) = GRID_PADS[i];
                     let color = match edit {
-                        GridEdit::Reset => DANGER,
-                        _ => TEXT,
+                        GridEdit::Reset => th().danger,
+                        _ => th().text,
                     };
                     self.tinted_button(pad, label, false, color, UiAction::Grid(deck, edit));
                 }
@@ -593,7 +611,7 @@ impl Painter {
                 PadMode::Stems => {
                     let stems = d.stems;
                     let stem = Stem::ALL[i % STEM_COUNT];
-                    let color = STEM_COLORS[stem.index()];
+                    let color = th().stems[stem.index()];
                     let playing = !stems.muted[stem.index()];
                     let label = STEM_PAD_LABELS[stem.index()];
                     let solo = i >= STEM_COUNT;
@@ -607,7 +625,7 @@ impl Painter {
                     // but greyed.
                     let color = match stems.available {
                         true => color,
-                        false => DIM_TEXT,
+                        false => th().dim_text,
                     };
                     self.tinted_button(
                         pad,
@@ -625,7 +643,7 @@ impl Painter {
                         );
                         let ink = match lit && stems.available {
                             true => ink_on(color),
-                            false => SOFT_TEXT,
+                            false => th().soft_text,
                         };
                         self.label(caption, "SOLO", 7.5, ink, Align::Center);
                     }
@@ -648,7 +666,7 @@ impl Painter {
             button,
             range,
             false,
-            TEXT,
+            th().text,
             UiAction::Deck(deck, DeckAction::CycleTempoRange),
         );
         let value = (v.d.tempo_fader + 1.0) / 2.0;
@@ -657,7 +675,7 @@ impl Painter {
             value,
             true,
             true,
-            DECK_COLORS[deck.index()],
+            th().decks[deck.index()],
             Slider::Tempo(deck),
         );
     }

@@ -8,7 +8,7 @@ mod layout;
 mod mixer_view;
 mod painter;
 mod settings_view;
-mod theme;
+pub(crate) mod theme;
 mod waves;
 
 use std::path::PathBuf;
@@ -22,12 +22,12 @@ use dj_audio_io::{AudioOutput, BufferGrown, CallbackStats};
 use dj_engine::{
     ChannelControl, Command, DeckAction, DeckId, DeckSnapshot, EngineHandle, EngineSnapshot,
     FxControl, HOT_CUES, HotCue, MasterControl, OutputMode, SAMPLER_SLOTS, STEM_COUNT,
-    SamplerControl, Stem, TempoRange,
+    SamplerControl, Stem, TempoRange, Transport,
 };
 use dj_library::{AnalysisSource, CollectionKind, CueKind, Library, StoredCue};
 use dj_ui::WaveformStyle;
 
-use crate::browser::{Browser, Column, Filter, track_key};
+use crate::browser::{Browser, Column, Filter, MatchRef, track_key};
 use crate::library_worker::{LibraryWorker, WorkerEvent, to_library, trusted_grid};
 use crate::recorder::{self, RecordEvent, Recorder};
 use crate::settings::{BUFFER_CHOICES, Settings, tempo_range_percent};
@@ -147,7 +147,16 @@ struct DeckInfo {
     pads: PadState,
     /// Length of the next auto loop.
     loop_beats: LoopBeats,
+    /// The track's library id, once looked up (`Some(None)`: not in the library).
+    library_id: Option<Option<i64>>,
+    /// Its id and its copies' (the same song elsewhere), worked out with the id.
+    copies: Vec<i64>,
+    /// Seconds it has been heard (playing with its fader up), to count it as played.
+    heard: f64,
 }
+
+/// A track counts as played (marked, and added to History) after this much listening.
+const PLAYED_SECONDS: f64 = 30.0;
 
 /// Auto-loop length in beats; 4 to start with.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -265,6 +274,17 @@ pub struct Frontend {
     control_requests: Option<mpsc::Sender<ControlRequest>>,
     midi: Option<Midi>,
     learning: Option<Learning>,
+    /// The deck panels and waveform lanes, where a dragged track can be dropped.
+    drop_zones: [[Area; 2]; 2],
+    last_frame: Instant,
+    /// The theme file in use (if not a built-in theme) and when it was last changed,
+    /// to reload it when it's saved.
+    theme_file: Option<(PathBuf, Option<std::time::SystemTime>)>,
+    /// What was wrong with the theme, for the settings screen.
+    theme_problem: Option<String>,
+    last_theme_check: Instant,
+    /// The audio thread was found not to be real-time and the user has been told.
+    told_not_realtime: bool,
 }
 
 impl Frontend {
@@ -328,9 +348,16 @@ impl Frontend {
             control_requests,
             midi: None,
             learning: None,
+            drop_zones: [[Area::new(0.0, 0.0, 0.0, 0.0); 2]; 2],
+            last_frame: Instant::now(),
+            theme_file: None,
+            theme_problem: None,
+            last_theme_check: Instant::now(),
+            told_not_realtime: false,
         };
         frontend.reload_browser();
         frontend.restore_sampler();
+        frontend.apply_theme();
         frontend
     }
 
@@ -404,6 +431,7 @@ impl Frontend {
                 pads.delete_armed = false;
             }
             UiAction::SamplerSync => self.send(Command::Sampler(SamplerControl::ToggleSync)),
+            UiAction::MatchTolerance => self.browser.cycle_match_tolerance(),
             UiAction::Learn(LearnAction::Done) => self.stop_learning(),
             UiAction::Learn(LearnAction::Clear) => {
                 self.control_request(ControlRequest::ClearLearned)
@@ -546,6 +574,14 @@ impl Frontend {
                 self.finish_naming();
                 self.delete_armed = false;
                 self.browser.set_filter(filter);
+            }
+            Control::BrowserView(view) => {
+                self.finish_naming();
+                self.delete_armed = false;
+                self.browser.set_filter(match view {
+                    SideView::Matching => Filter::Matching,
+                    SideView::History => Filter::History,
+                });
             }
             Control::Collection(index) => {
                 if let Some(collection) = self.browser.collections.get(index).cloned() {
@@ -696,6 +732,16 @@ impl Frontend {
                 });
                 if let Some(index) = target {
                     self.add_to_collection(index, track);
+                } else if let Some(deck) = self.deck_under(x, y) {
+                    // Dropped on a deck: load it there.
+                    let path = self
+                        .browser
+                        .rows()
+                        .find(|t| t.id == track)
+                        .map(|t| t.path.clone());
+                    if let Some(path) = path {
+                        self.load_to(deck, path);
+                    }
                 }
             }
             // A click without dragging selects the deck.
@@ -1096,6 +1142,17 @@ impl Frontend {
                 self.change_settings(|s| s.key_notation = notation);
             }
             SettingRow::Midi => self.start_learning(),
+            SettingRow::Quantize => {
+                let on = !s.quantize;
+                self.change_settings(|s| s.quantize = on);
+                self.send(Command::SetQuantize(on));
+            }
+            SettingRow::Theme => {
+                let names = theme::available(&self.themes_folder());
+                let name = step(&names, &s.theme, by);
+                self.change_settings(|s| s.theme = name.clone());
+                self.apply_theme();
+            }
             SettingRow::Waveform => {
                 let styles = [WaveformStyle::Spectrum, WaveformStyle::ThreeBand];
                 let style = step(&styles, &s.waveform, by);
@@ -1158,8 +1215,13 @@ impl Frontend {
                             .audio_device
                             .clone()
                             .unwrap_or_else(|| "System default".to_string());
+                        let priority = match self.stats.snapshot().realtime {
+                            Some(true) => " · real-time",
+                            Some(false) => " · not real-time",
+                            None => "",
+                        };
                         let detail = format!(
-                            "Using {} — {} outputs at {} Hz",
+                            "Using {} — {} outputs at {} Hz{priority}",
                             self.audio.device_name(),
                             channels,
                             self.audio.sample_rate()
@@ -1211,6 +1273,14 @@ impl Frontend {
                         .to_string(),
                         "Both decks now, and at start; K changes one deck".to_string(),
                     ),
+                    SettingRow::Quantize => (
+                        match s.quantize {
+                            true => "On",
+                            false => "Off",
+                        }
+                        .to_string(),
+                        "Now, and at start; Q or QUANTIZE changes it for now".to_string(),
+                    ),
                     SettingRow::KeyNotation => (
                         match s.key_notation {
                             KeyNotation::OpenKey => "Open Key (8m)",
@@ -1220,6 +1290,22 @@ impl Frontend {
                         .to_string(),
                         "How keys are written on the decks and in the browser".to_string(),
                     ),
+                    SettingRow::Theme => {
+                        let detail = match (&self.theme_problem, &self.theme_file) {
+                            (Some(problem), _) => {
+                                warn = true;
+                                problem.clone()
+                            }
+                            (None, Some((path, _))) => {
+                                format!("{}: saved edits show at once", tilde(path))
+                            }
+                            (None, None) => format!(
+                                "Built in. dj --write-theme NAME makes one to edit in {}",
+                                tilde(&self.themes_folder())
+                            ),
+                        };
+                        (s.theme.clone(), detail)
+                    }
                     SettingRow::Midi => match &self.midi {
                         Some(midi) => (
                             midi.name.clone(),
@@ -1270,6 +1356,71 @@ impl Frontend {
                 }
             })
             .collect()
+    }
+
+    /// Say once if the audio thread isn't real-time: then anything busy on the machine
+    /// can delay it, which is the commonest cause of dropouts.
+    fn check_realtime(&mut self) {
+        if self.told_not_realtime || self.stats.snapshot().realtime != Some(false) {
+            return;
+        }
+        self.told_not_realtime = true;
+        tracing::warn!(
+            "the audio thread isn't real-time, so a busy machine can delay it and drop out. \
+             Through a sound server's ALSA plugin (the desktop default) this is expected; \
+             with a hardware device (--device hw:…) allow real-time priority (ulimit -r, \
+             or LimitRTPRIO in a systemd unit). See README, \"Real-time audio\"."
+        );
+        self.notify(
+            "Audio isn't running at real-time priority, so a busy computer can cause dropouts \
+             (see the log)."
+                .to_string(),
+        );
+    }
+
+    fn themes_folder(&self) -> PathBuf {
+        crate::themes_folder(&self.settings_path)
+    }
+
+    /// Draw with the theme the settings name; the dark theme if it can't be loaded.
+    fn apply_theme(&mut self) {
+        let name = self.settings.theme.clone();
+        match theme::load(&name, &self.themes_folder()) {
+            Ok((loaded, problems, file)) => {
+                for problem in &problems {
+                    tracing::warn!("theme {name}: {problem}");
+                }
+                self.theme_problem = match problems.len() {
+                    0 => None,
+                    1 => Some(problems[0].clone()),
+                    n => Some(format!("{} (and {} more; see the log)", problems[0], n - 1)),
+                };
+                let modified = file.as_ref().and_then(|f| modified(f));
+                self.theme_file = file.map(|f| (f, modified));
+                theme::set_theme(loaded);
+            }
+            Err(err) => {
+                tracing::error!("theme {name}: {err}");
+                self.theme_problem = Some(err);
+                self.theme_file = None;
+                theme::set_theme(theme::Theme::dark());
+            }
+        }
+    }
+
+    /// Reload the theme file when it has been saved (checked once a second).
+    fn watch_theme(&mut self) {
+        if self.last_theme_check.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_theme_check = Instant::now();
+        let Some((path, seen)) = &self.theme_file else {
+            return;
+        };
+        if modified(path) != *seen {
+            tracing::info!("theme file changed; reloading {}", path.display());
+            self.apply_theme();
+        }
     }
 
     fn control_request(&mut self, request: ControlRequest) {
@@ -1569,6 +1720,100 @@ impl Frontend {
         self.reload_browser();
     }
 
+    /// The deck whose panel or waveform is at (`x`, `y`).
+    fn deck_under(&self, x: f32, y: f32) -> Option<DeckId> {
+        DeckId::ALL.into_iter().find(|deck| {
+            self.drop_zones[deck.index()]
+                .iter()
+                .any(|a| a.contains(x, y))
+        })
+    }
+
+    /// The deck the mix follows: the sync master, else the playing deck with the higher
+    /// fader, else the selected deck if it has a track.
+    fn lead_deck(&self, state: &EngineSnapshot) -> Option<DeckId> {
+        let loaded = |deck: DeckId| state.deck(deck).track.is_some();
+        if let Some(master) = DeckId::ALL.into_iter().find(|&d| {
+            state.deck(d).sync_master && loaded(d) && state.deck(d).transport.is_moving()
+        }) {
+            return Some(master);
+        }
+        let playing: Vec<DeckId> = DeckId::ALL
+            .into_iter()
+            .filter(|&d| state.deck(d).transport.is_moving())
+            .collect();
+        match playing.as_slice() {
+            [one] => Some(*one),
+            [a, b] => match state.channel(*b).fader > state.channel(*a).fader {
+                true => Some(*b),
+                false => Some(*a),
+            },
+            _ => Some(self.selected).filter(|&d| loaded(d)),
+        }
+    }
+
+    /// The library id of the track on `deck`. Found among the browser's tracks (all of
+    /// them, not just those shown) and remembered; a file not in the library yet is
+    /// looked for again each frame, so it's found once a scan adds it.
+    fn deck_library_id(&mut self, deck: DeckId) -> Option<i64> {
+        let info = &self.decks[deck.index()];
+        if let Some(id) = info.library_id.flatten() {
+            return Some(id);
+        }
+        let id = self.browser.track_at(info.path.as_ref()?).map(|t| t.id)?;
+        let copies = self.browser.copies_of(id);
+        let info = &mut self.decks[deck.index()];
+        info.library_id = Some(Some(id));
+        info.copies = copies;
+        Some(id)
+    }
+
+    /// Count listening time and mark tracks played; point Matching at the lead deck;
+    /// hold off background library work while anything plays.
+    fn follow_the_mix(&mut self, state: &EngineSnapshot, keys: [Option<MusicalKey>; 2]) {
+        if let Some(worker) = &self.worker {
+            let playing = DeckId::ALL
+                .iter()
+                .any(|&deck| state.deck(deck).transport.is_moving());
+            worker.set_paused(playing);
+        }
+        let dt = self.last_frame.elapsed().as_secs_f64().min(0.5);
+        self.last_frame = Instant::now();
+        let ids = DeckId::ALL.map(|deck| self.deck_library_id(deck));
+        for deck in DeckId::ALL {
+            let audible = state.deck(deck).transport == Transport::Playing
+                && state.channel(deck).fader > 0.05;
+            let info = &mut self.decks[deck.index()];
+            if audible {
+                info.heard += dt;
+            }
+            if let (true, Some(id)) = (info.heard >= PLAYED_SECONDS, ids[deck.index()]) {
+                self.browser.mark_played(id);
+            }
+        }
+        let reference = self.lead_deck(state).map(|deck| {
+            let d = state.deck(deck);
+            let title = self.decks[deck.index()]
+                .track
+                .as_ref()
+                .map(|t| t.title.clone())
+                .unwrap_or_default();
+            MatchRef {
+                title,
+                // Rounded, so a moving fader doesn't re-sort the list every frame.
+                bpm: d.bpm(state.sample_rate).map(|b| (b * 10.0).round() / 10.0),
+                key: keys[deck.index()],
+                // The decks' tracks, and copies of them (the same song on a USB drive).
+                exclude: self
+                    .decks
+                    .iter()
+                    .flat_map(|d| d.copies.iter().copied())
+                    .collect(),
+            }
+        });
+        self.browser.set_matching(reference);
+    }
+
     fn add_to_collection(&mut self, index: usize, track: i64) {
         let Some(collection) = self.browser.collections.get(index).cloned() else {
             return;
@@ -1634,6 +1879,44 @@ impl Frontend {
     }
 
     /// Keys while the browser shows. Returns true if the key was used.
+    /// Show the previous or next view in the sidebar's order.
+    fn step_view(&mut self, by: i32) {
+        let mut views = vec![Filter::All];
+        views.extend(
+            self.browser
+                .sources
+                .iter()
+                .map(|s| Filter::Folder(s.path.clone())),
+        );
+        views.push(Filter::Matching);
+        views.push(Filter::History);
+        let current = views.iter().position(|v| *v == self.browser.filter);
+        let collection = self.browser.filter.collection_id();
+        // In sidebar order: crates, then playlists.
+        let mut collections = self.browser.collections.clone();
+        collections.sort_by_key(|c| c.kind == CollectionKind::Playlist);
+        // Crates and playlists by id: their track lists are loaded when opened.
+        let total = views.len() + collections.len();
+        let at = match (current, collection) {
+            (Some(i), _) => i as i32,
+            (None, Some(id)) => {
+                (views.len() + collections.iter().position(|c| c.id == id).unwrap_or(0)) as i32
+            }
+            (None, None) => 0,
+        };
+        let next = (at + by).rem_euclid(total as i32) as usize;
+        self.finish_naming();
+        self.delete_armed = false;
+        match views.get(next) {
+            Some(view) => self.browser.set_filter(view.clone()),
+            None => {
+                if let Some(c) = collections.get(next - views.len()) {
+                    self.show_collection(c.id, c.kind);
+                }
+            }
+        }
+    }
+
     fn browser_key(&mut self, key: Key, repeat: bool) -> bool {
         if self.naming.is_some() {
             match key {
@@ -1673,6 +1956,8 @@ impl Frontend {
             Key::PageUp => self.browser.move_selection(-page, self.browser_visible),
             Key::PageDown => self.browser.move_selection(page, self.browser_visible),
             Key::Enter if !repeat => self.load_selected(self.selected),
+            Key::Left => self.step_view(-1),
+            Key::Right => self.step_view(1),
             Key::Char('/') => self.browser.search_focused = true,
             Key::Escape => self.browser_focus = false,
             _ => return false,
@@ -1727,6 +2012,9 @@ impl Frontend {
                         cues_restored: cues.iter().all(|c| !c.is_set()),
                         pads,
                         loop_beats,
+                        library_id: None,
+                        copies: Vec::new(),
+                        heard: 0.0,
                     };
                     if std::mem::take(&mut self.play_on_load[deck.index()]) {
                         self.send(Command::deck(deck, DeckAction::PlayPause));
@@ -1976,6 +2264,8 @@ impl Delegate for Frontend {
         self.poll_loader();
         self.poll_library();
         self.poll_recorder();
+        self.watch_theme();
+        self.check_realtime();
         self.maybe_log_stats();
         let state = self.engine.snapshot();
         self.persist_cues(&state);
@@ -2109,21 +2399,12 @@ impl Delegate for Frontend {
                 .map(|t| (t.title.clone(), self.pointer)),
             _ => None,
         };
-        let loaded = DeckId::ALL.map(|deck| {
-            let path = self.decks[deck.index()].path.as_ref()?;
-            self.browser
-                .rows()
-                .find(|t| &t.path == path)
-                .map(|t| t.id)
-                .or_else(|| {
-                    self.library
-                        .as_ref()?
-                        .track(path)
-                        .ok()
-                        .flatten()
-                        .map(|t| t.id)
-                })
-        });
+        self.follow_the_mix(&state, keys.map(|k| k.map(|(key, _)| key)));
+        let loaded = DeckId::ALL.map(|deck| self.decks[deck.index()].library_id.flatten());
+        self.drop_zones = DeckId::ALL.map(|deck| [layout.deck(deck), layout.waveform(deck)]);
+        let drop_deck = drag
+            .as_ref()
+            .and_then(|_| self.deck_under(self.pointer.0, self.pointer.1));
         self.browser_visible = painter.browser(BrowserView {
             area: layout.browser,
             browser: &self.browser,
@@ -2133,6 +2414,10 @@ impl Delegate for Frontend {
             deck_keys: keys.map(|k| k.map(|(key, _)| key)),
             notation: self.settings.key_notation,
             drag: drag.as_ref().map(|(title, at)| (title.as_str(), *at)),
+            drop_deck: drop_deck.map(|deck| {
+                let busy = state.deck(deck).transport.is_moving();
+                (deck, self.drop_zones[deck.index()], busy)
+            }),
             naming: self.naming.as_ref().map(|(id, text)| (*id, text.as_str())),
             delete_armed: self.delete_armed,
         });
@@ -2303,6 +2588,8 @@ enum UiAction {
     SamplerModeArm(DeckId),
     SamplerSync,
     Learn(LearnAction),
+    /// The Matching view's BPM tolerance: next step.
+    MatchTolerance,
     Help,
     NewCollection(CollectionKind),
     RenameCollection,
@@ -2363,6 +2650,13 @@ fn list_devices() -> Vec<String> {
     seen
 }
 
+/// The browser views with no data of their own (so they fit in a `Copy` control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideView {
+    Matching,
+    History,
+}
+
 /// What MIDI learn binds when a control is clicked on screen.
 fn learn_target(control: Control) -> Option<Target> {
     use DeckTarget as D;
@@ -2415,6 +2709,11 @@ fn learn_target(control: Control) -> Option<Target> {
         Control::BrowserList | Control::BrowserRow(_) => global(G::Browse),
         _ => None,
     }
+}
+
+/// When a file was last changed.
+fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
 /// A sample's name for its pad: the file name without the extension.
@@ -2590,6 +2889,8 @@ enum Control {
     BrowserSort(Column),
     /// 0 is all tracks, then the sources in order.
     BrowserSource(usize),
+    /// The sidebar's Matching and History views.
+    BrowserView(SideView),
     /// A crate or playlist, by index into the browser's list.
     Collection(usize),
 }

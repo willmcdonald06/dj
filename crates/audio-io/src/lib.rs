@@ -487,6 +487,8 @@ struct Renderer {
     /// When the flag is set, the engine goes back through this queue (for restarting
     /// the stream) and the callback plays silence from then on.
     give_back: Option<(Arc<AtomicBool>, rtrb::Producer<Engine>)>,
+    /// The thread's scheduling has been checked (once, on the first callback).
+    checked_realtime: bool,
 }
 
 impl Renderer {
@@ -504,6 +506,7 @@ impl Renderer {
             incoming,
             engine: None,
             give_back: None,
+            checked_realtime: false,
         }
     }
 
@@ -515,6 +518,11 @@ impl Renderer {
     {
         let started = Instant::now();
         let channels = self.channels;
+        if !self.checked_realtime {
+            // One system call, once per stream.
+            self.checked_realtime = true;
+            self.stats.record_realtime(thread_is_realtime());
+        }
 
         no_alloc(|| {
             if let Some((release, queue)) = &mut self.give_back {
@@ -550,6 +558,21 @@ impl Renderer {
         let frames = data.len() / channels;
         self.stats
             .record_callback(started.elapsed(), frames, self.sample_rate);
+    }
+}
+
+/// Whether the calling thread runs under a real-time scheduling policy.
+fn thread_is_realtime() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: queries the calling thread's own policy; no memory is passed.
+        let policy = unsafe { libc::sched_getscheduler(0) };
+        policy == libc::SCHED_FIFO || policy == libc::SCHED_RR
+    }
+    // CoreAudio and WASAPI give their callback threads their own real-time scheduling.
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
     }
 }
 

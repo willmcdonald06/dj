@@ -196,10 +196,24 @@ keys, shown by an outline in the selected deck's colour; clicking anywhere else,
 - Click a column header to sort; again to reverse.
 - **/** or click the search box, then type; every word must match the title, artist,
   album or file name. Enter or Esc leaves the search box.
-- ↑/↓ and Page Up/Down select, **Enter** loads onto the selected deck (Tab switches),
-  LOAD A / LOAD B load onto either, and a double-click loads onto the selected deck.
+- ↑/↓ and Page Up/Down select, ←/→ step through the sidebar's views, **Enter** loads
+  onto the selected deck (Tab switches), LOAD A / LOAD B load onto either, and a
+  double-click loads onto the selected deck.
+- **Drag a track onto a deck** (its panel or its waveform) to load it there. The deck
+  lights up in its colour, or red if it's playing (a playing deck never takes a new
+  track).
 - Tracks on a deck are marked A/B. Keys are in their wheel colour, filled when they mix
   with what's loaded.
+- **Matching** (like Rekordbox's): the tracks that fit the one leading the mix (the sync
+  master, else the playing deck with its fader higher), within a BPM tolerance (±3, ±6
+  or ±10%, the button in the toolbar; half and double time count) and in a compatible
+  key (the same key first, then a step round the wheel or the relative major/minor).
+  It follows the tempo and, with key lock off, the key the track really sounds in. The
+  tracks on the decks, and copies of them (the same song in another folder or on a USB
+  drive), are left out.
+- **History**: the tracks played this session, in order. A track counts as played after
+  30 seconds with its fader up; played tracks are ticked and dimmed everywhere, so the
+  ones still to play stand out.
 - **Crates** (unordered, sorted like the rest) and **playlists** (your order, shown in
   the # column) are in the sidebar. The + by CRATES or PLAYLISTS makes one and you
   type its name (Enter to keep it). Drag a track onto one to add it. While viewing one:
@@ -405,12 +419,37 @@ change applies at once and is saved to `~/.config/dj/settings.toml` (macOS:
   the old one is kept and the row says why. When the dropout watchdog has had to raise
   the buffer, the buffer row says so.
 - **Decks:** tempo range and key lock, for both decks now and at every start (**R**
-  and **K** still change one deck).
-- **Display:** key notation (Open Key, Camelot, musical) and waveform colours.
+  and **K** still change one deck), and quantize (on by default).
+- **Display:** key notation (Open Key, Camelot, musical), waveform colours and the
+  [theme](#themes).
 
 Command-line options (`--device`, `--buffer`, `--rate`, `--key-notation`,
 `--waveform`) override the file for that run and are never written into it. A file
 that can't be read is kept as `settings.toml.bad` and the defaults are used.
+
+## Themes
+
+Three themes are built in: **dark** (the default), **contrast** (brighter text and
+edges) and **daylight** (light panels for bright rooms; the waveform lanes stay dark).
+Pick one in the settings, or `--theme NAME` for one run.
+
+Your own themes are TOML files in `~/.config/dj/themes/` (next to the settings file).
+`dj --write-theme NAME` writes `themes/NAME.toml` with every colour listed and what it's
+for, starting from the current built-in theme; pick NAME in the settings and edit the
+file: saved changes show within a second, no restart. Colours are `"#rrggbb"` or
+`"#rrggbbaa"`; a file can name a `base` theme and list only the colours it changes:
+
+```toml
+base = "daylight"
+[colors]
+panel = "#e8e0d0"
+decks = ["#0060ff", "#ff6000"]
+hot_cues = ["#ff0000", "#ff8000", "#ffd000", "#00c040", "#00c0d0", "#0060ff", "#8040ff", "#ff40c0"]
+```
+
+Mistakes (an unknown colour name, a value that isn't a colour) are listed on the
+settings screen's Theme row and the rest of the file still applies. The waveforms keep
+their own colours (the waveform colours setting).
 
 ## Recording
 
@@ -429,6 +468,30 @@ recording, the file is called `….wav.part` with its header updated every secon
 the app dies, the next start repairs and renames it. A recording longer than WAV's
 4 GB limit (about 4 hours at 48 kHz) carries on in `… part 2.wav`.
 
+## Real-time audio and memory
+
+The app is meant to run on a Raspberry Pi with 2 GB, so it keeps its memory small and
+keeps everything else away from the audio thread:
+
+- **Tracks are held as 16-bit samples** (with 2× headroom, about 90 dB of range): a
+  six-minute track takes 69 MB rather than 138 MB. One deck playing a 6½-minute track
+  is about 120 MB for the whole app without the UI.
+- **Background work gives way.** Decoding and analysing a track being loaded runs at a
+  lower priority (nice 10), the library thread at the lowest (nice 19), and the
+  library's analysis and timed rescans pause while any deck plays: decoding whole
+  tracks allocates and frees a lot of memory, which on a machine short of memory
+  stalls everything.
+- **Memory is locked** (never swapped out, code included) when the system allows it:
+  `ulimit -l unlimited`, or `LimitMEMLOCK=infinity` in the systemd unit. With the usual
+  desktop limit of 8 MB it isn't, and the log says so.
+- **The audio thread should be real-time.** The settings screen's device row says
+  whether it is, and the app warns once if not. cpal only promotes the thread for a
+  hardware device (`--device hw:…`, as on the Pi), and needs permission: `ulimit -r`
+  above 0 (or `LimitRTPRIO=95` in the systemd unit, or membership of a group that
+  `/etc/security/limits.d` gives `rtprio`). Through a sound server's ALSA plugin (the
+  desktop default) it stays a normal thread, so a busy desktop can still cause
+  dropouts.
+
 ## Key lock and sync
 
 Key lock runs each deck through a time-stretcher; on this machine two locked decks use
@@ -445,10 +508,15 @@ and makes that one the **master** (or makes this deck master if the other is emp
 The follower takes the master's tempo and stays on its beat, correcting drift with a
 rate offset of at most ±4%. Tempo changes on either synced deck move both. Turning SYNC
 off keeps the deck's current tempo; if the master turns it off, the other deck leads.
+Master always moves to the deck that is playing: when the master stops (paused, or its
+track runs out) while the other synced deck plays, that deck takes over at its tempo,
+and loading a new track onto the master hands over first. So the tempo carries on from
+track to track and never jumps to the next track's BPM. If the new master's tempo is
+past its fader's range, the range widens to fit.
 A following deck you start lands on the master's beat. Pressing S says on screen what
 happened, or why sync isn't possible (an empty deck, or a deck with no beatgrid).
 
-Quantize (**Q**) makes cue points snap to the nearest beat and ←/→ jump by whole bars
+Quantize (**Q**, on at start unless the settings say otherwise) makes cue points snap to the nearest beat and ←/→ jump by whole bars
 (4 beats), so jumping never knocks a deck off the beat. Hot cues, loops and beat jump
 (Milestone 5) will snap too.
 

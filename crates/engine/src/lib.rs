@@ -401,7 +401,10 @@ impl Engine {
                 Err(_) => break,
             };
             match load {
-                TrackLoad::Track { deck, track } => self.decks[deck.index()].load(Some(track)),
+                TrackLoad::Track { deck, track } => {
+                    self.sync.before_load(&mut self.decks, deck.index());
+                    self.decks[deck.index()].load(Some(track));
+                }
                 TrackLoad::Stems { deck, stems } => self.decks[deck.index()].set_stems(stems),
                 TrackLoad::Sample { slot, track, bpm } => self.sampler.load(slot, track, bpm),
             }
@@ -480,6 +483,10 @@ impl Engine {
                 self.decks[index].apply(action);
                 // On a follower, the fader sets the tempo of both decks.
                 self.sync.tempo_changed(&mut self.decks, index);
+            }
+            DeckAction::Eject => {
+                self.sync.before_load(&mut self.decks, index);
+                self.decks[index].apply(action);
             }
             DeckAction::PlayPause => {
                 let was_moving = self.decks[index].is_moving();
@@ -676,7 +683,7 @@ mod tests {
 
     /// A complete track of constant `level` (DC passes the EQ crossovers at unity).
     fn dc_track(id: u64, level: f32) -> Arc<Track> {
-        let (track, mut writer) = Track::new(TrackId(id), SR, SR as usize);
+        let (track, mut writer) = Track::new_exact(TrackId(id), SR, SR as usize);
         writer.push_interleaved(&vec![level; SR as usize * 2]);
         writer.finish();
         track
@@ -802,6 +809,12 @@ mod tests {
     }
 
     fn synced_pair_with(key_lock: bool) -> (Engine, EngineHandle) {
+        let (engine, handle, _) = synced_pair_and_loader(key_lock);
+        (engine, handle)
+    }
+
+    /// [`synced_pair_with`], plus the loader's track queue for loading more.
+    fn synced_pair_and_loader(key_lock: bool) -> (Engine, EngineHandle, TrackSender) {
         let mut config = EngineConfig::new(SR, 2);
         config.key_lock = key_lock;
         let EngineParts {
@@ -811,7 +824,7 @@ mod tests {
             ..
         } = Engine::new(config);
         for (deck, id, bpm) in [(DeckId::A, 1, 128.0), (DeckId::B, 2, 124.0)] {
-            let (track, mut writer) = Track::new(TrackId(id), SR, SR as usize * 120);
+            let (track, mut writer) = Track::new_exact(TrackId(id), SR, SR as usize * 120);
             writer.push_interleaved(&vec![0.1; SR as usize * 240]);
             writer.finish();
             tracks.send(deck, track).unwrap();
@@ -828,7 +841,7 @@ mod tests {
                 .unwrap();
         }
         render(&mut engine, 64);
-        (engine, handle)
+        (engine, handle, tracks)
     }
 
     fn bpm(handle: &mut EngineHandle, deck: DeckId) -> f64 {
@@ -954,6 +967,93 @@ mod tests {
             (bpm(&mut handle, DeckId::B) - 128.0).abs() < 0.01,
             "keeps its tempo"
         );
+    }
+
+    #[test]
+    fn master_passes_to_the_playing_deck_when_it_stops() {
+        let (mut engine, mut handle) = synced_pair();
+        play(&mut handle, DeckId::A);
+        play(&mut handle, DeckId::B);
+        sync(&mut handle, DeckId::B, true);
+        render(&mut engine, 1_000);
+        assert!(handle.snapshot().deck(DeckId::A).sync_master);
+        // The outgoing track stops: B carries on as master at the same tempo.
+        play(&mut handle, DeckId::A);
+        render(&mut engine, 480);
+        let snap = handle.snapshot();
+        assert!(snap.deck(DeckId::B).sync_master, "B leads now");
+        assert!(!snap.deck(DeckId::A).sync_master);
+        assert!(
+            (bpm(&mut handle, DeckId::B) - 128.0).abs() < 0.01,
+            "no jump"
+        );
+        // Starting A again, it follows B.
+        play(&mut handle, DeckId::A);
+        render(&mut engine, 480);
+        assert!(handle.snapshot().deck(DeckId::B).sync_master);
+        assert!((bpm(&mut handle, DeckId::A) - 128.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_new_track_on_the_master_never_moves_the_tempo() {
+        let (mut engine, mut handle, mut tracks) = synced_pair_and_loader(false);
+        // Both stopped, A (128 BPM) master, B following at 128.
+        sync(&mut handle, DeckId::B, true);
+        render(&mut engine, 480);
+        assert!(handle.snapshot().deck(DeckId::A).sync_master);
+        assert!((bpm(&mut handle, DeckId::B) - 128.0).abs() < 0.01);
+
+        // A 100 BPM track goes onto A, the way the loader delivers it.
+        let (track, mut writer) = Track::new_exact(TrackId(9), SR, SR as usize);
+        writer.push_interleaved(&vec![0.1; SR as usize * 2]);
+        writer.finish();
+        tracks.send(DeckId::A, track).unwrap();
+        render(&mut engine, 64);
+        handle
+            .send(Command::deck(
+                DeckId::A,
+                DeckAction::SetBeatGrid {
+                    track: TrackId(9),
+                    grid: Some(BeatGrid::from_bpm(100.0, 0.0, SR)),
+                },
+            ))
+            .unwrap();
+        render(&mut engine, 480);
+        let snap = handle.snapshot();
+        assert!(
+            snap.deck(DeckId::B).sync_master,
+            "B took over before the load"
+        );
+        assert!(
+            (bpm(&mut handle, DeckId::B) - 128.0).abs() < 0.01,
+            "no jump"
+        );
+        assert!(
+            (bpm(&mut handle, DeckId::A) - 128.0).abs() < 0.01,
+            "A follows"
+        );
+    }
+
+    #[test]
+    fn taking_over_beyond_the_fader_range_widens_it() {
+        let (mut engine, mut handle) = synced_pair();
+        // A at +8%: 138.24 BPM. B (124 BPM) follows at +11.5%, past its ±8%.
+        handle
+            .send(Command::deck(
+                DeckId::A,
+                DeckAction::SetTempo { fader: 1.0 },
+            ))
+            .unwrap();
+        play(&mut handle, DeckId::A);
+        play(&mut handle, DeckId::B);
+        sync(&mut handle, DeckId::B, true);
+        render(&mut engine, 1_000);
+        play(&mut handle, DeckId::A);
+        render(&mut engine, 480);
+        let b = *handle.snapshot().deck(DeckId::B);
+        assert!(b.sync_master);
+        assert_eq!(b.tempo_range, TempoRange::Percent16);
+        assert!((bpm(&mut handle, DeckId::B) - 138.24).abs() < 0.01);
     }
 
     #[test]

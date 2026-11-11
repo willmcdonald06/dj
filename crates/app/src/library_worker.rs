@@ -9,7 +9,11 @@
 //! - **Analysis:** tracks with no analysis are decoded and analysed one at a time, so
 //!   the browser can show BPM and key for everything.
 //!
-//! Not RT-safe. Uses one core while analysing; the audio thread has priority.
+//! Not RT-safe. Uses one core while analysing, at the lowest CPU priority. While a
+//! deck plays ([`LibraryWorker::set_paused`]) analysis and the timed rescans wait:
+//! decoding whole tracks allocates and frees hundreds of megabytes a minute, and on a
+//! machine short of memory that stalls the audio thread long enough to drop out. A
+//! RESCAN pressed by hand, or a drive plugged in, still scans at once.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -58,6 +62,7 @@ pub struct LibraryWorker {
     requests: mpsc::Sender<Request>,
     events: mpsc::Receiver<WorkerEvent>,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -71,9 +76,12 @@ impl LibraryWorker {
         let (outbox, events) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let paused = Arc::new(AtomicBool::new(false));
+        let thread_paused = Arc::clone(&paused);
         let thread = std::thread::Builder::new()
             .name("library".into())
             .spawn(move || {
+                lowest_priority();
                 let library = match Library::open(&database) {
                     Ok(library) => library,
                     Err(err) => {
@@ -88,6 +96,7 @@ impl LibraryWorker {
                     inbox,
                     outbox,
                     stop: thread_stop,
+                    paused: thread_paused,
                 }
                 .run();
             })?;
@@ -95,8 +104,14 @@ impl LibraryWorker {
             requests,
             events,
             stop,
+            paused,
             thread: Some(thread),
         })
+    }
+
+    /// Hold off background analysis and timed rescans (while a deck plays).
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
     }
 
     pub fn rescan(&self) {
@@ -125,6 +140,22 @@ struct Worker {
     inbox: mpsc::Receiver<Request>,
     outbox: mpsc::Sender<WorkerEvent>,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+}
+
+/// Run this thread at the lowest CPU priority (Linux), so it always gives way.
+fn lowest_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain syscalls on this thread's own id; no memory is passed.
+        let result = unsafe {
+            let tid = libc::gettid();
+            libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 19)
+        };
+        if result != 0 {
+            tracing::debug!("couldn't lower the library thread's priority");
+        }
+    }
 }
 
 impl Worker {
@@ -132,29 +163,54 @@ impl Worker {
         self.send(WorkerEvent::Sources(self.sources()));
         let mut next_scan = Instant::now();
         let mut next_drive_poll = Instant::now();
+        // A scan asked for (RESCAN, a new drive): done even while paused.
+        let mut scan_now = true;
+        let mut said_paused = false;
         while !self.stopping() {
             let now = Instant::now();
+            let paused = self.paused.load(Ordering::Relaxed);
             if now >= next_drive_poll {
                 next_drive_poll = now + DRIVE_POLL_INTERVAL;
                 let drives = removable_drives();
                 if drives != self.drives {
                     self.drives = drives;
                     self.send(WorkerEvent::Sources(self.sources()));
-                    next_scan = now;
+                    scan_now = true;
                 }
             }
-            if now >= next_scan {
+            if scan_now || (now >= next_scan && !paused) {
+                scan_now = false;
                 self.scan_all();
                 next_scan = Instant::now() + RESCAN_INTERVAL;
             }
-            let analysed = self.analyse_next();
+            let analysed = match paused {
+                true => {
+                    let waiting = self
+                        .library
+                        .needing_analysis(ANALYSIS_VERSION, 1)
+                        .is_ok_and(|next| !next.is_empty());
+                    if !said_paused && waiting {
+                        self.send(WorkerEvent::Status(
+                            "Analysis paused while a deck plays".to_string(),
+                        ));
+                        said_paused = true;
+                    }
+                    false
+                }
+                false => {
+                    if std::mem::take(&mut said_paused) {
+                        self.send(WorkerEvent::Status(String::new()));
+                    }
+                    self.analyse_next()
+                }
+            };
             // With work left, keep going; when idle, wait for a request or a timer.
             let wait = match analysed {
                 true => Duration::ZERO,
                 false => DRIVE_POLL_INTERVAL,
             };
             match self.inbox.recv_timeout(wait) {
-                Ok(Request::Rescan) => next_scan = Instant::now(),
+                Ok(Request::Rescan) => scan_now = true,
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }

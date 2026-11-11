@@ -44,13 +44,13 @@ impl Painter {
             style,
             grid_to,
         } = *look;
-        self.fill(area, LANE);
+        self.fill(area, th().lane);
         self.fill(
             Area::new(area.x, area.y + area.height / 2.0, area.width, self.px(1.0)),
-            LINE,
+            th().line,
         );
         // Deck letter at the left edge.
-        let color = DECK_COLORS[deck.index()];
+        let color = th().decks[deck.index()];
         let tab = Area::new(area.x, area.y, self.px(3.0), area.height);
         self.overlay_fill(tab, color);
         let chip = Area::new(
@@ -76,7 +76,7 @@ impl Painter {
                 Some(_) => "Analysing…",
                 None => "Empty: load a track from the browser, or drop a file here",
             };
-            self.label(area, message, 12.0, DIM_TEXT, Align::Center);
+            self.label(area, message, 12.0, th().dim_text, Align::Center);
             return;
         };
         let (start, fpp) = view_window(d, area.width, base_fpp);
@@ -116,13 +116,7 @@ impl Painter {
                     true => {
                         let w = self.px(1.5);
                         let (top, bottom) = (area.y.min(grid_to), area.bottom().max(grid_to));
-                        self.overlay(Rect::new(
-                            x - w / 2.0,
-                            top,
-                            w,
-                            bottom - top,
-                            Color::rgba(1.0, 1.0, 1.0, 0.6),
-                        ));
+                        self.overlay(Rect::new(x - w / 2.0, top, w, bottom - top, th().bar_line));
                         if beat >= 0 {
                             let label = Area::new(
                                 x + self.px(3.0),
@@ -134,7 +128,7 @@ impl Painter {
                                 label,
                                 format!("{}", beat / 4 + 1),
                                 9.5,
-                                Color::rgb(0.75, 0.75, 0.78),
+                                th().bar_number,
                                 Align::Left,
                             );
                         }
@@ -142,13 +136,7 @@ impl Painter {
                     false => {
                         let w = self.px(1.0);
                         for y in [area.y, area.bottom() - tick] {
-                            self.overlay(Rect::new(
-                                x - w / 2.0,
-                                y,
-                                w,
-                                tick,
-                                Color::rgba(0.6, 0.6, 0.65, 0.8),
-                            ));
+                            self.overlay(Rect::new(x - w / 2.0, y, w, tick, th().beat_tick));
                         }
                     }
                 }
@@ -167,7 +155,7 @@ impl Painter {
                     area.y,
                     x1 - x0,
                     area.height,
-                    LOOP.with_alpha(alpha),
+                    th().loops.with_alpha(alpha),
                 ));
                 for edge in [region.start, region.end] {
                     if (start..end).contains(&edge) {
@@ -176,7 +164,7 @@ impl Painter {
                             area.y,
                             self.px(2.0),
                             area.height,
-                            LOOP,
+                            th().loops,
                         ));
                     }
                 }
@@ -188,7 +176,7 @@ impl Painter {
                 area.y,
                 self.px(2.0),
                 area.height,
-                LOOP,
+                th().loops,
             ));
         }
         // Hot cues: a line with a numbered flag at the top.
@@ -197,7 +185,7 @@ impl Painter {
                 continue;
             };
             let x = x_of(at);
-            let color = HOT_CUE_COLORS[slot];
+            let color = th().hot_cues[slot];
             self.overlay(Rect::new(
                 x - self.px(1.0),
                 area.y,
@@ -224,13 +212,13 @@ impl Painter {
                 area.y,
                 self.px(2.0),
                 area.height,
-                Color::rgba(1.0, 1.0, 1.0, 0.45),
+                th().slip_marker,
             ));
         }
         // The cue point: triangles on the edges.
         let cue = d.cue as f64;
         if (start..end).contains(&cue) {
-            self.edge_markers(area, x_of(cue), self.px(10.0), CUE);
+            self.edge_markers(area, x_of(cue), self.px(10.0), th().cue);
         }
     }
 
@@ -251,13 +239,19 @@ impl Painter {
     pub fn playhead(&mut self, top: Area, bottom: Area) {
         let w = self.px(2.0);
         let x = top.centre_x() - w / 2.0;
-        self.overlay(Rect::new(x, top.y, w, bottom.bottom() - top.y, PLAYHEAD));
+        self.overlay(Rect::new(
+            x,
+            top.y,
+            w,
+            bottom.bottom() - top.y,
+            th().playhead,
+        ));
         let size = self.px(12.0);
         self.edge_markers(
             Area::new(top.x, top.y, top.width, bottom.bottom() - top.y),
             top.centre_x(),
             size,
-            PLAYHEAD,
+            th().playhead,
         );
     }
 
@@ -271,11 +265,11 @@ impl Painter {
         base_fpp: f64,
         style: WaveformStyle,
     ) {
-        self.fill(area, WELL);
+        self.fill(area, th().well);
         let mid = area.y + area.height / 2.0;
         self.fill(
             Area::new(area.x, mid - self.px(0.5), area.width, self.px(1.0)),
-            LINE,
+            th().line,
         );
         let half = area.height / 2.0 - self.px(1.0);
         let w = self.px(4.5);
@@ -313,7 +307,11 @@ impl Painter {
         let y = bar_area.y + (bar_area.height - h) / 2.0;
         let cx = bar_area.centre_x();
         let max = bar_area.width / 2.0;
-        self.rounded(Area::new(bar_area.x, y, bar_area.width, h), h / 2.0, WELL);
+        self.rounded(
+            Area::new(bar_area.x, y, bar_area.width, h),
+            h / 2.0,
+            th().well,
+        );
         self.fill(
             Area::new(
                 cx - self.px(0.5),
@@ -321,20 +319,20 @@ impl Painter {
                 self.px(1.0),
                 h + self.px(4.0),
             ),
-            SOFT_TEXT,
+            th().soft_text,
         );
         let Some(offset) = offset_ms else {
-            self.label(text, "PHASE", 9.0, DIM_TEXT, Align::Left);
+            self.label(text, "PHASE", 9.0, th().dim_text, Align::Left);
             return;
         };
         let fraction = (offset / PHASE_BAR_MS).clamp(-1.0, 1.0) as f32;
         let w = (max * fraction.abs()).max(self.px(2.0));
         let (x, color) = match fraction >= 0.0 {
-            true => (cx - w, DECK_COLORS[0]),
-            false => (cx, DECK_COLORS[1]),
+            true => (cx - w, th().decks[0]),
+            false => (cx, th().decks[1]),
         };
         let color = match offset.abs() < 1.0 {
-            true => PLAY,
+            true => th().play,
             false => color,
         };
         self.rounded(Area::new(x, y, w, h), h / 2.0, color);
@@ -343,7 +341,7 @@ impl Painter {
             o if o > 0.0 => format!("A +{o:.1} ms"),
             o => format!("B +{:.1} ms", -o),
         };
-        self.bold(text, label, 9.5, SOFT_TEXT, Align::Left);
+        self.bold(text, label, 9.5, th().soft_text, Align::Left);
     }
 
     /// The whole track, with what has played dimmed, cue points and the playhead.
@@ -377,7 +375,7 @@ impl Painter {
             // Until the analysis lands, show decoding progress.
             None => self.fill(
                 Area::new(area.x, area.y, at(d.ready) - area.x, area.height),
-                LINE,
+                th().line,
             ),
         }
         self.overlay(Rect::new(
@@ -385,7 +383,7 @@ impl Painter {
             area.y,
             at(d.position) - area.x,
             area.height,
-            Color::rgba(0.0, 0.0, 0.0, 0.55),
+            th().played_shade,
         ));
         if let Some(region) = d.loop_region {
             let (x0, x1) = (at(region.start as u64), at(region.end as u64));
@@ -394,13 +392,13 @@ impl Painter {
                 area.y,
                 (x1 - x0).max(self.px(2.0)),
                 area.height,
-                LOOP.with_alpha(0.45),
+                th().loops.with_alpha(0.45),
             ));
         }
         for (slot, cue) in d.hot_cues.iter().enumerate() {
             if let Some(frame) = cue.position() {
                 let x = at(frame as u64);
-                let color = HOT_CUE_COLORS[slot];
+                let color = th().hot_cues[slot];
                 self.overlay(Rect::new(
                     x - self.px(1.0),
                     area.y,
@@ -428,7 +426,7 @@ impl Painter {
                 area.bottom() - cue_size * 0.7,
                 cue_size,
                 cue_size * 0.7,
-                CUE,
+                th().cue,
             )
             .shape(Shape::Triangle { quarter_turns: 3 }),
         );
@@ -437,7 +435,7 @@ impl Painter {
             area.y,
             self.px(2.0),
             area.height,
-            PLAYHEAD,
+            th().playhead,
         ));
         self.hit(area, Control::Overview(deck, d.length));
     }

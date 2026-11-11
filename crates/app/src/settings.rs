@@ -39,6 +39,8 @@ pub struct Settings {
     pub key_notation: KeyNotation,
     /// How waveforms are coloured.
     pub waveform: WaveformStyle,
+    /// A built-in theme or a theme file's name.
+    pub theme: String,
     /// Substring of the output device's name; `None` for the system default.
     pub audio_device: Option<String>,
     /// Period size in frames; `None` for the device's default.
@@ -49,6 +51,8 @@ pub struct Settings {
     pub tempo_range: TempoRange,
     /// Whether key lock is on when the app starts.
     pub key_lock: bool,
+    /// Whether quantize is on when the app starts.
+    pub quantize: bool,
     pub sampler: SamplerBank,
 }
 
@@ -58,12 +62,14 @@ impl Default for Settings {
         Self {
             key_notation: KeyNotation::default(),
             waveform: WaveformStyle::default(),
+            theme: "dark".to_string(),
             audio_device: audio.device,
             buffer_frames: audio.buffer_frames,
             sample_rate: audio.sample_rate,
             output_mode: OutputMode::InternalMix,
             tempo_range: TempoRange::default(),
             key_lock: true,
+            quantize: true,
             sampler: SamplerBank::default(),
         }
     }
@@ -74,6 +80,7 @@ impl Default for Settings {
 pub struct Overrides {
     pub key_notation: Option<KeyNotation>,
     pub waveform: Option<WaveformStyle>,
+    pub theme: Option<String>,
     pub audio_device: Option<String>,
     /// `Some(None)`: the device default (`--buffer default`).
     pub buffer_frames: Option<Option<u32>>,
@@ -88,6 +95,9 @@ impl Settings {
         }
         if let Some(style) = overrides.waveform {
             self.waveform = style;
+        }
+        if let Some(theme) = &overrides.theme {
+            self.theme = theme.clone();
         }
         if let Some(device) = &overrides.audio_device {
             self.audio_device = Some(device.clone());
@@ -196,12 +206,15 @@ impl Settings {
              # 8, 16 or 50 (percent).\n\
              tempo_range = {range}\n\
              key_lock = {key_lock}\n\
+             quantize = {quantize}\n\
              \n\
              [display]\n\
              # \"open\", \"camelot\" or \"musical\".\n\
              key_notation = \"{notation}\"\n\
              # \"spectrum\" or \"bands\".\n\
              waveform = \"{waveform}\"\n\
+             # A built-in theme (dark, contrast, daylight) or a file in themes/.\n\
+             theme = {theme}\n\
              \n\
              [sampler]\n\
              # One file per slot (\"\" for empty), and one-shot, gate or loop.\n\
@@ -214,8 +227,10 @@ impl Settings {
             output = output_mode_name(self.output_mode),
             range = tempo_range_percent(self.tempo_range),
             key_lock = self.key_lock,
+            quantize = self.quantize,
             notation = key_notation_name(self.key_notation),
             waveform = waveform_style_name(self.waveform),
+            theme = toml_string(&self.theme),
             slots = self
                 .sampler
                 .paths
@@ -273,6 +288,7 @@ struct AudioFile {
 struct DecksFile {
     tempo_range: Option<u32>,
     key_lock: Option<bool>,
+    quantize: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -280,6 +296,7 @@ struct DecksFile {
 struct DisplayFile {
     key_notation: Option<String>,
     waveform: Option<String>,
+    theme: Option<String>,
 }
 
 impl File {
@@ -314,11 +331,17 @@ impl File {
         if let Some(on) = self.decks.key_lock {
             s.key_lock = on;
         }
+        if let Some(on) = self.decks.quantize {
+            s.quantize = on;
+        }
         if let Some(name) = self.display.key_notation {
             match parse_key_notation(&name) {
                 Some(notation) => s.key_notation = notation,
                 None => problems.push(format!("key_notation = {name:?} isn't known")),
             }
+        }
+        if let Some(name) = self.display.theme.filter(|n| !n.trim().is_empty()) {
+            s.theme = name;
         }
         if let Some(name) = self.display.waveform {
             match parse_waveform_style(&name) {
@@ -481,12 +504,14 @@ mod tests {
         let settings = Settings {
             key_notation: KeyNotation::Camelot,
             waveform: WaveformStyle::ThreeBand,
+            theme: "my \"own\"".to_string(),
             audio_device: Some("DJ-505 \"USB\"".to_string()),
             buffer_frames: None,
             sample_rate: 44_100,
             output_mode: OutputMode::PerDeck,
             tempo_range: TempoRange::Percent16,
             key_lock: false,
+            quantize: false,
             sampler: SamplerBank {
                 paths: std::array::from_fn(|i| match i {
                     2 => Some(PathBuf::from("/music/air horn.wav")),

@@ -277,6 +277,26 @@ fn load_track_stems(
     Ok((Arc::new(loaded.stems), info))
 }
 
+/// How much to lower decode and analysis threads (Linux nice value). They run while
+/// decks play, and must give way to the audio and UI threads: on a four-core Pi a
+/// track's analysis takes a core for several seconds.
+const DECODE_NICE: i32 = 10;
+
+/// Lower this thread's priority to [`DECODE_NICE`] (Linux; a no-op elsewhere).
+fn lower_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: plain syscalls on this thread's own id; no memory is passed.
+        let result = unsafe {
+            let tid = libc::gettid();
+            libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, DECODE_NICE)
+        };
+        if result != 0 {
+            tracing::debug!("couldn't lower a decode thread's priority");
+        }
+    }
+}
+
 /// Decode a whole sample and find its tempo.
 fn decode_sample(
     path: &std::path::Path,
@@ -477,6 +497,7 @@ impl Manager {
         let spawned = std::thread::Builder::new()
             .name(format!("sample-{slot}"))
             .spawn(move || {
+                lower_priority();
                 let result = decode_sample(&path, id, engine_rate);
                 let _ = outbox.send(Message::SampleReady { slot, path, result });
             });
@@ -502,6 +523,7 @@ impl Manager {
         let spawned = std::thread::Builder::new()
             .name(format!("decode-{deck:?}"))
             .spawn(move || {
+                lower_priority();
                 let mut decoded = None;
                 let mut on_playable = |track: Arc<Track>, info: TrackInfo| {
                     decoded = Some(Arc::clone(&track));

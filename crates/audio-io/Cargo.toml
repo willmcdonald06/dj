@@ -13,6 +13,7 @@ cpal.workspace = true
 rtrb.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+libc.workspace = true
 # In debug builds, aborts if the audio callback allocates; compiles to nothing in release.
 assert_no_alloc.workspace = true
 

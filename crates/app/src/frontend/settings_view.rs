@@ -1,7 +1,7 @@
 //! The settings screen: a panel over everything, one row per setting, each changed with
 //! ◂ ▸ (or by clicking its value). Changes apply and save at once.
 
-use dj_ui::{Align, Color, Rect};
+use dj_ui::{Align, Rect};
 
 use super::layout::{Area, Layout};
 use super::painter::{Icon, Painter};
@@ -16,20 +16,24 @@ pub enum SettingRow {
     Output,
     TempoRange,
     KeyLock,
+    Quantize,
     KeyNotation,
     Waveform,
+    Theme,
     Midi,
 }
 
 impl SettingRow {
-    pub const ALL: [SettingRow; 8] = [
+    pub const ALL: [SettingRow; 10] = [
         SettingRow::Device,
         SettingRow::Buffer,
         SettingRow::Output,
         SettingRow::TempoRange,
         SettingRow::KeyLock,
+        SettingRow::Quantize,
         SettingRow::KeyNotation,
         SettingRow::Waveform,
+        SettingRow::Theme,
         SettingRow::Midi,
     ];
 
@@ -40,8 +44,10 @@ impl SettingRow {
             SettingRow::Output => "Outputs",
             SettingRow::TempoRange => "Tempo range",
             SettingRow::KeyLock => "Key lock at start",
+            SettingRow::Quantize => "Quantize at start",
             SettingRow::KeyNotation => "Key notation",
             SettingRow::Waveform => "Waveform colours",
+            SettingRow::Theme => "Theme",
             SettingRow::Midi => "MIDI controller",
         }
     }
@@ -50,8 +56,8 @@ impl SettingRow {
     fn section(self) -> &'static str {
         match self {
             SettingRow::Device | SettingRow::Buffer | SettingRow::Output => "AUDIO",
-            SettingRow::TempoRange | SettingRow::KeyLock => "DECKS",
-            SettingRow::KeyNotation | SettingRow::Waveform => "DISPLAY",
+            SettingRow::TempoRange | SettingRow::KeyLock | SettingRow::Quantize => "DECKS",
+            SettingRow::KeyNotation | SettingRow::Waveform | SettingRow::Theme => "DISPLAY",
             SettingRow::Midi => "CONTROLLER",
         }
     }
@@ -95,7 +101,7 @@ impl Painter {
     pub fn settings(&mut self, layout: &Layout, v: SettingsView<'_>) {
         self.popup(|p| {
             let screen = Area::new(0.0, 0.0, layout.width, layout.height);
-            p.fill(screen, Color::rgba(0.0, 0.0, 0.0, 0.7));
+            p.fill(screen, th().scrim);
             p.hit(
                 screen,
                 Control::Button(UiAction::Settings(SettingsAction::Close)),
@@ -109,18 +115,12 @@ impl Painter {
                 .min(layout.height - p.px(16.0));
             let panel = Area::new((layout.width - w) / 2.0, (layout.height - h) / 2.0, w, h);
             p.push(
-                Rect::new(
-                    panel.x,
-                    panel.y,
-                    panel.width,
-                    panel.height,
-                    Color::rgb(0.05, 0.05, 0.06),
-                )
-                .gradient(Color::rgb(0.03, 0.03, 0.037))
-                .rounded(p.px(8.0)),
+                Rect::new(panel.x, panel.y, panel.width, panel.height, th().popup)
+                    .gradient(th().popup_bottom)
+                    .rounded(p.px(8.0)),
             );
             p.push(
-                Rect::new(panel.x, panel.y, panel.width, panel.height, LINE)
+                Rect::new(panel.x, panel.y, panel.width, panel.height, th().line)
                     .rounded(p.px(8.0))
                     .stroke(p.px(1.0)),
             );
@@ -131,20 +131,20 @@ impl Painter {
 
             let inner = panel.inset(p.px(20.0));
             let (title, rest) = inner.split_top(p.px(28.0), p.px(8.0));
-            p.bold(title, "Settings", 16.0, TEXT, Align::Left);
+            p.bold(title, "Settings", 16.0, th().text, Align::Left);
             let (close, hints) = title.split_right(p.px(72.0), p.px(12.0));
             p.label(
                 hints,
                 "↑↓ choose   ◂ ▸ change   Esc close",
                 10.0,
-                SOFT_TEXT,
+                th().soft_text,
                 Align::Right,
             );
             p.button(
                 close,
                 "CLOSE",
                 false,
-                TEXT,
+                th().text,
                 UiAction::Settings(SettingsAction::Close),
             );
 
@@ -155,7 +155,7 @@ impl Painter {
                 if row.row.section() != section {
                     section = row.row.section();
                     let heading = Area::new(list.x, y, list.width, heading_h);
-                    p.bold(heading, section, 10.0, SOFT_TEXT, Align::Left);
+                    p.bold(heading, section, 10.0, th().soft_text, Align::Left);
                     y += heading_h;
                 }
                 let area = Area::new(list.x, y, list.width, row_h);
@@ -167,7 +167,7 @@ impl Painter {
                 footer,
                 format!("Changes apply at once and are saved to {}", v.path),
                 10.0,
-                SOFT_TEXT,
+                th().soft_text,
                 Align::Left,
             );
         });
@@ -176,7 +176,7 @@ impl Painter {
     fn setting_row(&mut self, area: Area, row: &RowView, selected: bool) {
         let id = row.row;
         if selected {
-            self.rounded(area, self.px(4.0), SELECTED_ROW);
+            self.rounded(area, self.px(4.0), th().selected_row);
         }
         self.hit(
             area,
@@ -184,7 +184,7 @@ impl Painter {
         );
         let inner = area.inset_x(self.px(10.0));
         let (label, rest) = inner.split_left(self.px(150.0), self.px(10.0));
-        self.label(label, id.label(), 12.0, TEXT, Align::Left);
+        self.label(label, id.label(), 12.0, th().text, Align::Left);
 
         let control_h = self.px(26.0);
         let top = area.y + self.px(4.0);
@@ -197,13 +197,13 @@ impl Painter {
             prev,
             Icon::Left,
             false,
-            TEXT,
+            th().text,
             UiAction::Settings(SettingsAction::Step(id, -1)),
         );
         self.well(value);
         let ink = match selected {
-            true => TEXT,
-            false => Color::rgb(0.7, 0.7, 0.74),
+            true => th().text,
+            false => th().text,
         };
         self.bold(
             value.inset_x(self.px(8.0)),
@@ -220,7 +220,7 @@ impl Painter {
             next,
             Icon::Right,
             false,
-            TEXT,
+            th().text,
             UiAction::Settings(SettingsAction::Step(id, 1)),
         );
         let detail = Area::new(
@@ -230,8 +230,8 @@ impl Painter {
             area.bottom() - value.bottom(),
         );
         let ink = match row.warn {
-            true => WARNING,
-            false => SOFT_TEXT,
+            true => th().warning,
+            false => th().soft_text,
         };
         self.label(detail, &row.detail, 10.0, ink, Align::Left);
     }
@@ -267,7 +267,7 @@ impl Painter {
                         area.y - p.px(3.0),
                         area.width + p.px(6.0),
                         area.height + p.px(6.0),
-                        WARNING,
+                        th().warning,
                     )
                     .rounded(p.px(5.0))
                     .stroke(p.px(2.0)),
@@ -276,10 +276,10 @@ impl Painter {
             let h = p.px(56.0);
             let bar = Area::new(0.0, layout.height - h, layout.width, h);
             p.push(
-                Rect::new(bar.x, bar.y, bar.width, bar.height, Color::rgb(0.06, 0.05, 0.02))
-                    .gradient(Color::rgb(0.035, 0.03, 0.012)),
+                Rect::new(bar.x, bar.y, bar.width, bar.height, th().learn_bar)
+                    .gradient(th().learn_bar_bottom),
             );
-            p.fill(Area::new(bar.x, bar.y, bar.width, p.px(2.0)), WARNING);
+            p.fill(Area::new(bar.x, bar.y, bar.width, p.px(2.0)), th().warning);
             p.hit(bar, Control::Button(UiAction::Settings(SettingsAction::Nothing)));
             let inner = Area::new(
                 bar.x + p.px(16.0),
@@ -288,17 +288,17 @@ impl Painter {
                 bar.height - p.px(18.0),
             );
             let (done, rest) = inner.split_right(p.px(72.0), p.px(8.0));
-            p.button(done, "DONE", true, WARNING, UiAction::Learn(LearnAction::Done));
+            p.button(done, "DONE", true, th().warning, UiAction::Learn(LearnAction::Done));
             let (clear, rest) = rest.split_right(p.px(92.0), p.px(16.0));
             p.tinted_button(
                 clear,
                 "CLEAR ALL",
                 false,
-                DANGER,
+                th().danger,
                 UiAction::Learn(LearnAction::Clear),
             );
             let (title, rest) = rest.split_left(p.px(104.0), p.px(12.0));
-            p.bold(title, "MIDI LEARN", 13.0, WARNING, Align::Left);
+            p.bold(title, "MIDI LEARN", 13.0, th().warning, Align::Left);
             let (top, bottom) = rest.split_top(rest.height / 2.0, 0.0);
             let headline = match (v.controller, v.waiting) {
                 (None, _) => "No MIDI controller found: plug one in (it connects within a \
@@ -311,8 +311,8 @@ impl Painter {
                     format!("Click a button, knob or fader on screen, then use the one on {name} you want for it")
                 }
             };
-            p.label(top, headline, 12.0, TEXT, Align::Left);
-            p.label(bottom, v.status, 10.5, SOFT_TEXT, Align::Left);
+            p.label(top, headline, 12.0, th().text, Align::Left);
+            p.label(bottom, v.status, 10.5, th().soft_text, Align::Left);
         });
     }
 }

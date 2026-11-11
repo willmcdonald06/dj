@@ -26,6 +26,13 @@ pub enum Mode {
         keys: String,
         /// Width and height in pixels, and the UI scale in percent.
         size: (u32, u32, u32),
+        /// A mouse drag from one point to another (pixels), done halfway through
+        /// after the keys and released three quarters of the way in.
+        drag: Option<((i32, i32), (i32, i32))>,
+    },
+    /// Write a theme file to edit, `themes/NAME.toml`, and exit.
+    WriteTheme {
+        name: String,
     },
     /// Log every incoming MIDI message (and what it maps to) until Ctrl-C.
     /// `all` also shows clock and active-sensing messages.
@@ -89,17 +96,22 @@ impl Cli {
                 "--midi-monitor-all" => cli.mode = Mode::MidiMonitor { all: true },
                 "--screenshot" => {
                     let path = PathBuf::from(value(&mut args, &arg)?);
-                    let (millis, keys, size) = match &cli.mode {
+                    let (millis, keys, size, drag) = match &cli.mode {
                         Mode::Screenshot {
-                            millis, keys, size, ..
-                        } => (*millis, keys.clone(), *size),
-                        _ => (3000, String::new(), (1280, 800, 100)),
+                            millis,
+                            keys,
+                            size,
+                            drag,
+                            ..
+                        } => (*millis, keys.clone(), *size, *drag),
+                        _ => (3000, String::new(), (1280, 800, 100), None),
                     };
                     cli.mode = Mode::Screenshot {
                         path,
                         millis,
                         keys,
                         size,
+                        drag,
                     };
                 }
                 "--screenshot-after" => {
@@ -109,6 +121,16 @@ impl Cli {
                     match &mut cli.mode {
                         Mode::Screenshot { millis, .. } => *millis = (after * 1000.0) as u64,
                         _ => bail!("--screenshot-after needs --screenshot first"),
+                    }
+                }
+                "--screenshot-drag" => {
+                    let text = value(&mut args, &arg)?;
+                    let parsed = parse_drag(&text).with_context(|| {
+                        format!("--screenshot-drag takes X1,Y1:X2,Y2 in pixels, not {text:?}")
+                    })?;
+                    match &mut cli.mode {
+                        Mode::Screenshot { drag, .. } => *drag = Some(parsed),
+                        _ => bail!("--screenshot-drag needs --screenshot first"),
                     }
                 }
                 "--screenshot-size" => {
@@ -155,6 +177,12 @@ impl Cli {
                         seconds: seconds.parse().context("--headless takes seconds")?,
                     };
                 }
+                "--theme" => cli.overrides.theme = Some(value(&mut args, &arg)?),
+                "--write-theme" => {
+                    cli.mode = Mode::WriteTheme {
+                        name: value(&mut args, &arg)?,
+                    }
+                }
                 "--settings" => cli.settings_file = Some(PathBuf::from(value(&mut args, &arg)?)),
                 "--device" => cli.overrides.audio_device = Some(value(&mut args, &arg)?),
                 "--rate" => {
@@ -191,6 +219,16 @@ impl Cli {
     }
 }
 
+/// `X1,Y1:X2,Y2`.
+fn parse_drag(text: &str) -> Option<((i32, i32), (i32, i32))> {
+    let point = |p: &str| {
+        let (x, y) = p.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    };
+    let (from, to) = text.split_once(':')?;
+    Some((point(from)?, point(to)?))
+}
+
 fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> anyhow::Result<String> {
     args.next().with_context(|| format!("{flag} needs a value"))
 }
@@ -219,10 +257,17 @@ OPTIONS:
   --screenshot PNG     No window: run for a few seconds, then save the screen
                        (1280x800) to PNG. --screenshot-after SECONDS sets the
                        delay (default 3); --screenshot-keys KEYS types KEYS
-                       halfway through (\t is Tab, a space is Space);
-                       --screenshot-size WxH[@SCALE] sets the size
+                       halfway through (\t is Tab, a space is Space,
+                       \n is Enter, ←→↑↓ are the arrow keys);
+                       --screenshot-size WxH[@SCALE] sets the size;
+                       --screenshot-drag X1,Y1:X2,Y2 drags the mouse halfway
+                       through and lets go at three quarters
   --music DIR          Music folder to scan into the library (repeatable). Default:
                        ~/Music. USB drives are added when plugged in
+  --theme NAME         Theme for this run: dark, contrast, daylight or a file in
+                       themes/ next to the settings file
+  --write-theme NAME   Write themes/NAME.toml (every colour, from the current
+                       built-in theme) to edit, then exit. Saved edits show at once
   --recordings DIR     Where REC saves the main output (24-bit WAV). Default:
                        Recordings in the music folder (~/Music/Recordings)
   --library FILE       Library database (hot cues, loops). Default:

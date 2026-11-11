@@ -756,6 +756,12 @@ impl Deck {
         let rate = self.tempo_rate();
         self.sync_rate = None;
         self.phase_correction = 0.0;
+        // Widen the tempo range if the fader can't reach the rate, so it doesn't jump.
+        while (rate - 1.0).abs() > self.tempo_range.fraction() + 1e-6
+            && self.tempo_range != TempoRange::Percent50
+        {
+            self.tempo_range = self.tempo_range.next();
+        }
         self.set_rate_with_fader(rate);
     }
 
@@ -1489,7 +1495,7 @@ mod tests {
     /// A complete track whose left sample at frame `i` is `i` and right is `-i`, so the
     /// output shows exactly which frame played.
     fn ramp_track(frames: usize) -> Arc<Track> {
-        let (track, mut writer) = Track::new(TrackId(7), SR, frames);
+        let (track, mut writer) = Track::new_exact(TrackId(7), SR, frames);
         let samples: Vec<f32> = (0..frames).flat_map(|i| [i as f32, -(i as f32)]).collect();
         writer.push_interleaved(&samples);
         writer.finish();
@@ -1652,7 +1658,7 @@ mod tests {
 
     #[test]
     fn plays_silence_past_decoded_frames_while_loading() {
-        let (track, mut writer) = Track::new(TrackId(1), SR, 1000);
+        let (track, mut writer) = Track::new_exact(TrackId(1), SR, 1000);
         writer.push_interleaved(&[0.5; 200]); // 100 frames
         let mut deck = new_deck(false);
         deck.load(Some(Arc::clone(&track)));
@@ -1712,7 +1718,7 @@ mod tests {
     /// Two seconds of silence with a short burst at frame 48 000.
     fn click_track() -> Arc<Track> {
         let frames = SR as usize * 2;
-        let (track, mut writer) = Track::new(TrackId(9), SR, frames);
+        let (track, mut writer) = Track::new_exact(TrackId(9), SR, frames);
         let samples: Vec<f32> = (0..frames)
             .flat_map(|i| {
                 let s = match (48_000..48_048).contains(&i) {
@@ -1761,7 +1767,7 @@ mod tests {
 
     fn sine_track(hz: f32, seconds: f32) -> Arc<Track> {
         let frames = (SR as f32 * seconds) as usize;
-        let (track, mut writer) = Track::new(TrackId(5), SR, frames);
+        let (track, mut writer) = Track::new_exact(TrackId(5), SR, frames);
         let samples: Vec<f32> = (0..frames)
             .flat_map(|i| {
                 let s = (std::f32::consts::TAU * hz * i as f32 / SR as f32).sin() * 0.5;
@@ -2320,7 +2326,7 @@ mod tests {
         let hz = [220.0, 330.0, 550.0, 70.0];
         let stem =
             |s: usize, i: usize| 0.2 * (std::f32::consts::TAU * hz[s] * i as f32 / SR as f32).sin();
-        let (track, mut writer) = Track::new(TrackId(7), SR, frames);
+        let (track, mut writer) = Track::new_exact(TrackId(7), SR, frames);
         let mix: Vec<f32> = (0..frames)
             .flat_map(|i| {
                 let v: f32 = (0..4).map(|s| stem(s, i)).sum();

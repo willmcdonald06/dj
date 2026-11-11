@@ -13,6 +13,10 @@
 //! - Turning SYNC off keeps the deck's current tempo (its fader moves there). If the
 //!   master turns SYNC off, the other synced deck becomes master.
 //! - Starting a following deck lands it on the master's beat.
+//! - Master moves to whichever synced deck is playing: when the master stops (paused,
+//!   or its track ends) while the follower plays, or when a new track is loaded onto
+//!   the master (or it is ejected), the follower takes over at the tempo it is playing.
+//!   So the tempo carries on from track to track and never jumps to a new track's BPM.
 //!
 //! # RT safety
 //!
@@ -116,11 +120,32 @@ impl Sync {
         decks[master].set_rate_with_fader(master_rate as f32);
     }
 
+    /// `deck` is about to get a new track (or be ejected). If it leads and the other
+    /// deck follows with a track of its own, the other deck takes over first, so the
+    /// new track's tempo doesn't move it.
+    pub fn before_load(&mut self, decks: &mut [Deck; 2], deck: usize) {
+        let partner = other(deck);
+        if self.master == Some(deck) && decks[partner].sync_lock() && decks[partner].has_track() {
+            self.hand_over(decks, partner);
+        }
+    }
+
+    fn hand_over(&mut self, decks: &mut [Deck; 2], to: usize) {
+        decks[to].become_master();
+        self.master = Some(to);
+    }
+
     /// Update the follower's rate and phase correction. Call once per callback.
     pub fn update(&mut self, decks: &mut [Deck; 2], sample_rate: u32) {
-        let Some(master) = self.master else {
+        let Some(mut master) = self.master else {
             return;
         };
+        // The deck that is playing leads: hand over when the master stops.
+        let partner = other(master);
+        if !decks[master].is_moving() && decks[partner].sync_lock() && decks[partner].is_moving() {
+            self.hand_over(decks, partner);
+            master = partner;
+        }
         let follower = other(master);
         if !decks[follower].sync_lock() {
             return;

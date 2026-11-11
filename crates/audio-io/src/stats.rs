@@ -19,6 +19,8 @@ pub struct CallbackStats {
     max_duration_ns: AtomicU64,
     last_frames: AtomicU64,
     histogram: [AtomicU64; HISTOGRAM_BUCKETS],
+    /// The callback thread's scheduling: 0 not checked yet, 1 real-time, 2 not.
+    realtime: std::sync::atomic::AtomicU8,
 }
 
 /// A point-in-time copy of [`CallbackStats`].
@@ -33,6 +35,9 @@ pub struct StatsSnapshot {
     pub last_frames: u64,
     /// Callback count per 10%-of-budget bucket.
     pub histogram: [u64; HISTOGRAM_BUCKETS],
+    /// Whether the callback thread runs at real-time priority (`None` until the first
+    /// callback has checked).
+    pub realtime: Option<bool>,
 }
 
 impl CallbackStats {
@@ -51,6 +56,15 @@ impl CallbackStats {
         let budget_ns = (frames as u64 * 1_000_000_000) / u64::from(sample_rate.max(1));
         let bucket = bucket_for(ns, budget_ns);
         self.histogram[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record whether the callback thread is real-time. RT-safe.
+    pub fn record_realtime(&self, realtime: bool) {
+        let value = match realtime {
+            true => 1,
+            false => 2,
+        };
+        self.realtime.store(value, Ordering::Relaxed);
     }
 
     /// Called from the stream's error callback.
@@ -74,6 +88,11 @@ impl CallbackStats {
             max_duration: Duration::from_nanos(self.max_duration_ns.load(Ordering::Relaxed)),
             last_frames: self.last_frames.load(Ordering::Relaxed),
             histogram,
+            realtime: match self.realtime.load(Ordering::Relaxed) {
+                1 => Some(true),
+                2 => Some(false),
+                _ => None,
+            },
         }
     }
 }

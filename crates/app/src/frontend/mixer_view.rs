@@ -32,7 +32,7 @@ impl Painter {
 
     fn channel_strip(&mut self, deck: DeckId, area: Area, v: &MixerView<'_>) {
         let ch = v.state.channel(deck);
-        let color = DECK_COLORS[deck.index()];
+        let color = th().decks[deck.index()];
         let gap = self.px(6.0);
         let knob_w = self.px(48.0);
         // Knobs on the outside, the fader towards the middle, like the deck panels.
@@ -42,7 +42,7 @@ impl Painter {
         };
         let knob_h = knobs.height / 5.0;
         let rows: [(&str, f32, bool, dj_ui::Color, Slider); 5] = [
-            ("TRIM", ch.trim, true, TEXT, Slider::Trim(deck)),
+            ("TRIM", ch.trim, true, th().text, Slider::Trim(deck)),
             ("HI", ch.eq[2], true, color, Slider::Eq(deck, 2)),
             ("MID", ch.eq[1], true, color, Slider::Eq(deck, 1)),
             ("LOW", ch.eq[0], true, color, Slider::Eq(deck, 0)),
@@ -50,7 +50,7 @@ impl Painter {
                 "FILTER",
                 (ch.filter + 1.0) / 2.0,
                 true,
-                FILTER,
+                th().filter,
                 Slider::Filter(deck),
             ),
         ];
@@ -73,7 +73,14 @@ impl Painter {
             DeckId::A => column.split_right(meter_w, self.px(4.0)),
             DeckId::B => column.split_left(meter_w, self.px(4.0)),
         };
-        self.fader(fader, ch.fader, false, false, TEXT, Slider::Fader(deck));
+        self.fader(
+            fader,
+            ch.fader,
+            false,
+            false,
+            th().text,
+            Slider::Fader(deck),
+        );
         self.meter(
             Area::new(
                 meter.x,
@@ -83,7 +90,7 @@ impl Painter {
             ),
             v.meters[deck.index()],
         );
-        self.button(cue, "CUE", ch.pfl, CUE, UiAction::Pfl(deck));
+        self.button(cue, "CUE", ch.pfl, th().cue, UiAction::Pfl(deck));
     }
 
     /// Main and headphone levels, the headphone cue/main blend, split cue and the main
@@ -91,10 +98,10 @@ impl Painter {
     fn master_section(&mut self, area: Area, v: &MixerView<'_>) {
         let m = &v.state.master;
         let (label, rest) = area.split_top(self.px(14.0), self.px(4.0));
-        self.bold(label, "MAIN", 9.0, SOFT_TEXT, Align::Center);
+        self.bold(label, "MAIN", 9.0, th().soft_text, Align::Center);
         let knob_h = self.px(46.0);
         let (main, rest) = rest.split_top(knob_h, self.px(4.0));
-        self.knob(main, "LEVEL", m.main_level, false, TEXT, Slider::Main);
+        self.knob(main, "LEVEL", m.main_level, false, th().text, Slider::Main);
         let meter_h = (rest.height - 3.0 * knob_h - self.px(56.0)).max(self.px(20.0));
         let (meter, rest) = rest.split_top(meter_h, self.px(6.0));
         let w = self.px(6.0);
@@ -103,12 +110,26 @@ impl Painter {
             v.meters[2],
         );
         let (heading, rest) = rest.split_top(self.px(12.0), self.px(2.0));
-        self.bold(heading, "PHONES", 9.0, SOFT_TEXT, Align::Center);
+        self.bold(heading, "PHONES", 9.0, th().soft_text, Align::Center);
         let (phones, rest) = rest.split_top(knob_h, self.px(4.0));
-        self.knob(phones, "LEVEL", m.phones_level, false, TEXT, Slider::Phones);
+        self.knob(
+            phones,
+            "LEVEL",
+            m.phones_level,
+            false,
+            th().text,
+            Slider::Phones,
+        );
         let (mix, rest) = rest.split_top(knob_h, self.px(6.0));
-        self.knob(mix, "CUE · MAIN", m.cue_mix, false, CUE, Slider::CueMix);
+        self.knob(
+            mix,
+            "CUE · MAIN",
+            m.cue_mix,
+            false,
+            th().cue,
+            Slider::CueMix,
+        );
         let (split, _) = rest.split_top(self.px(22.0), 0.0);
-        self.button(split, "SPLIT", m.split_cue, CUE, UiAction::SplitCue);
+        self.button(split, "SPLIT", m.split_cue, th().cue, UiAction::SplitCue);
     }
 }

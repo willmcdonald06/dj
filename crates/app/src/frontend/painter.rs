@@ -39,7 +39,7 @@ impl Painter {
     pub fn new(scale: f32, pressed: Option<UiAction>) -> Self {
         Self {
             scene: Scene {
-                background: BACKGROUND,
+                background: th().background,
                 ..Scene::default()
             },
             scale,
@@ -148,8 +148,8 @@ impl Painter {
     pub fn panel(&mut self, area: Area) {
         let r = self.px(6.0);
         self.push(
-            Rect::new(area.x, area.y, area.width, area.height, PANEL_TOP)
-                .gradient(PANEL)
+            Rect::new(area.x, area.y, area.width, area.height, th().panel_top)
+                .gradient(th().panel)
                 .rounded(r),
         );
     }
@@ -157,7 +157,7 @@ impl Painter {
     /// A sunken well inside a panel.
     pub fn well(&mut self, area: Area) {
         let r = self.px(3.0);
-        self.rounded(area, r, WELL);
+        self.rounded(area, r, th().well);
     }
 
     pub fn hit(&mut self, area: Area, control: Control) {
@@ -167,7 +167,7 @@ impl Painter {
     /// The body of a button: lit buttons fill with `color`; held ones darken.
     fn button_body(&mut self, area: Area, on: bool, color: Color, held: bool) -> Color {
         let r = self.px(4.0);
-        let rect = Rect::new(area.x, area.y, area.width, area.height, BUTTON_TOP).rounded(r);
+        let rect = Rect::new(area.x, area.y, area.width, area.height, th().button_top).rounded(r);
         match (on, held) {
             (true, false) => {
                 self.push(
@@ -185,13 +185,13 @@ impl Painter {
                 ink_on(darker(color, 0.5))
             }
             (false, true) => {
-                self.push(rect.with_color(BUTTON_HELD));
-                TEXT
+                self.push(rect.with_color(th().button_held));
+                th().text
             }
             (false, false) => {
-                self.push(rect.gradient(BUTTON_BOTTOM));
-                self.push(rect.with_color(LINE).stroke(self.px(1.0)));
-                SOFT_TEXT
+                self.push(rect.gradient(th().button_bottom));
+                self.push(rect.with_color(th().line).stroke(self.px(1.0)));
+                th().soft_text
             }
         }
     }
@@ -218,7 +218,7 @@ impl Painter {
         let ink = self.button_body(area, on, color, held);
         let ink = match on || held {
             true => ink,
-            false => color,
+            false => readable(color),
         };
         let size = (area.height / self.scale * 0.36).clamp(9.0, 14.0);
         self.bold(area, label, size, ink, Align::Center);
@@ -296,7 +296,7 @@ impl Painter {
         let dial = Area::new(area.centre_x() - d / 2.0, area.y, d, d);
         self.dial(dial, value, centred, color);
         let label_area = Area::new(area.x, dial.bottom(), area.width, label_h);
-        self.bold(label_area, label, 8.5, SOFT_TEXT, Align::Center);
+        self.bold(label_area, label, 8.5, th().soft_text, Align::Center);
         self.hit(
             Area::new(area.x, area.y, area.width, d),
             Control::Slider(slider, Drag::Knob),
@@ -329,7 +329,7 @@ impl Painter {
                 end: to,
             })
         };
-        self.push(ring(start, -start, LINE));
+        self.push(ring(start, -start, th().line));
         let (from, to) = match centred {
             true => (angle.min(0.0), angle.max(0.0)),
             false => (start, angle),
@@ -351,15 +351,9 @@ impl Painter {
             end: 2.0 * PI,
         };
         self.push(
-            Rect::new(
-                cap_area.x,
-                cap_area.y,
-                cap,
-                cap,
-                Color::rgb(0.09, 0.09, 0.105),
-            )
-            .gradient(Color::rgb(0.035, 0.035, 0.042))
-            .shape(disc),
+            Rect::new(cap_area.x, cap_area.y, cap, cap, th().knob_top)
+                .gradient(th().knob_bottom)
+                .shape(disc),
         );
         let dot = self.px(4.0);
         let reach = cap / 2.0 - dot;
@@ -369,7 +363,7 @@ impl Painter {
             dial.y + d / 2.0 - cos * reach,
         );
         self.push(
-            Rect::new(px - dot / 2.0, py - dot / 2.0, dot, dot, TEXT).shape(Shape::Arc {
+            Rect::new(px - dot / 2.0, py - dot / 2.0, dot, dot, th().text).shape(Shape::Arc {
                 thickness: dot,
                 start: 0.0,
                 end: 2.0 * PI,
@@ -401,15 +395,15 @@ impl Painter {
                 false => self.px(4.0),
             };
             let mark_color = match centre && i == 5 {
-                true => SOFT_TEXT,
-                false => LINE,
+                true => th().soft_text,
+                false => th().line,
             };
             for x in [area.x, area.right() - w] {
                 self.fill(Area::new(x, y - self.px(0.5), w, self.px(1.0)), mark_color);
             }
         }
         let slot = Area::new(area.centre_x() - slot_w / 2.0, top, slot_w, travel);
-        self.rounded(slot, slot_w / 2.0, WELL);
+        self.rounded(slot, slot_w / 2.0, th().well);
         let position = match inverted {
             true => value.clamp(0.0, 1.0),
             false => 1.0 - value.clamp(0.0, 1.0),
@@ -430,15 +424,9 @@ impl Painter {
             cap_h,
         );
         self.push(
-            Rect::new(
-                cap.x,
-                cap.y,
-                cap.width,
-                cap.height,
-                Color::rgb(0.32, 0.32, 0.36),
-            )
-            .gradient(Color::rgb(0.12, 0.12, 0.14))
-            .rounded(self.px(3.0)),
+            Rect::new(cap.x, cap.y, cap.width, cap.height, th().fader_top)
+                .gradient(th().fader_bottom)
+                .rounded(self.px(3.0)),
         );
         self.fill(
             Area::new(
@@ -447,7 +435,7 @@ impl Painter {
                 cap.width - self.px(6.0),
                 self.px(2.0),
             ),
-            TEXT,
+            th().text,
         );
         let drag = Drag::Vertical {
             inverted,
@@ -459,35 +447,30 @@ impl Painter {
 
     /// A vertical LED-style level meter, `level` 0..1 (1 = full scale).
     pub fn meter(&mut self, area: Area, level: f32) {
-        self.fill(area, WELL);
+        self.fill(area, th().well);
         let level = level.clamp(0.0, 1.0);
         if level > 0.0 {
             self.push(
-                Rect::new(area.x, area.y, area.width, area.height, METER_HIGH).gradient(METER_LOW),
+                Rect::new(area.x, area.y, area.width, area.height, th().meter_high)
+                    .gradient(th().meter_low),
             );
             self.fill(
                 Area::new(area.x, area.y, area.width, area.height * (1.0 - level)),
-                WELL,
+                th().well,
             );
         }
         // Segments.
         let step = self.px(4.0);
         let mut y = area.bottom() - step;
         while y > area.y {
-            self.fill(Area::new(area.x, y, area.width, self.px(1.0)), WELL);
+            self.fill(Area::new(area.x, y, area.width, self.px(1.0)), th().well);
             y -= step;
         }
     }
 }
 
 /// Text colour that reads on a `background` fill.
-pub fn ink_on(background: Color) -> Color {
-    let luminance = 0.2126 * background.r + 0.7152 * background.g + 0.0722 * background.b;
-    match luminance > 0.25 {
-        true => Color::rgb(0.02, 0.02, 0.025),
-        false => Color::rgb(0.95, 0.95, 0.97),
-    }
-}
+pub use super::theme::ink_on;
 
 trait WithColor {
     fn with_color(self, color: Color) -> Self;

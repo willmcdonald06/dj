@@ -10,7 +10,7 @@ use super::layout::Area;
 use super::painter::{Painter, ink_on};
 use super::theme::*;
 use super::waves::deck_letter;
-use super::{Control, UiAction, clock};
+use super::{Control, SideView, UiAction, clock};
 use crate::browser::{Browser, Column, Filter, track_key};
 
 /// What the browser view draws.
@@ -28,6 +28,9 @@ pub struct BrowserView<'a> {
     pub notation: KeyNotation,
     /// A track being dragged: its title and the pointer.
     pub drag: Option<(&'a str, (f32, f32))>,
+    /// The deck a dragged track is over: its panel and waveform, and whether it is
+    /// playing (and so won't take the track).
+    pub drop_deck: Option<(DeckId, [Area; 2], bool)>,
     /// A crate or playlist being named, and the text so far.
     pub naming: Option<(i64, &'a str)>,
     pub delete_armed: bool,
@@ -38,7 +41,7 @@ impl Painter {
     pub fn browser(&mut self, v: BrowserView<'_>) -> usize {
         self.panel(v.area);
         if v.focused {
-            let accent = DECK_COLORS[v.selected_deck.index()];
+            let accent = th().decks[v.selected_deck.index()];
             self.push(
                 Rect::new(
                     v.area.x,
@@ -61,15 +64,38 @@ impl Painter {
 
         if let Some((title, (px, py))) = v.drag {
             self.popup(|p| {
-                let w = p.px(240.0);
+                // Over a deck: outline it, in its colour, or red if it's playing.
+                let (label, color) = match v.drop_deck {
+                    Some((deck, zones, busy)) => {
+                        let color = match busy {
+                            true => th().danger,
+                            false => th().decks[deck.index()],
+                        };
+                        for zone in zones {
+                            p.rounded(zone, p.px(6.0), color.with_alpha(0.12));
+                            p.push(
+                                Rect::new(zone.x, zone.y, zone.width, zone.height, color)
+                                    .rounded(p.px(6.0))
+                                    .stroke(p.px(2.0)),
+                            );
+                        }
+                        let label = match busy {
+                            true => format!("Deck {} is playing", deck_letter(deck)),
+                            false => format!("Load on deck {}: {title}", deck_letter(deck)),
+                        };
+                        (label, color)
+                    }
+                    None => (title.to_string(), th().decks[0]),
+                };
+                let w = p.px(280.0);
                 let h = p.px(24.0);
                 let ghost = Area::new(px + p.px(12.0), py + p.px(8.0), w, h);
-                p.rounded(ghost, p.px(4.0), DECK_COLORS[0].with_alpha(0.92));
+                p.rounded(ghost, p.px(4.0), color.with_alpha(0.92));
                 p.label(
                     ghost.inset_x(p.px(8.0)),
-                    format!("+ {title}"),
+                    label,
                     12.0,
-                    TEXT,
+                    ink_on(color),
                     Align::Left,
                 );
             });
@@ -89,7 +115,7 @@ impl Painter {
 
         let heading = |painter: &mut Painter, y: f32, label: &str| {
             let head = Area::new(area.x + pad, y, area.width - 2.0 * pad, row_h);
-            painter.bold(head, label, 9.0, SOFT_TEXT, Align::Left);
+            painter.bold(head, label, 9.0, th().soft_text, Align::Left);
         };
         heading(self, y, "COLLECTION");
         y += row_h;
@@ -124,14 +150,55 @@ impl Painter {
                         chip.width,
                         chip.height - self.px(8.0),
                     );
-                    self.rounded(chip, self.px(3.0), WARNING);
-                    self.bold(chip, "USB", 8.0, ink_on(WARNING), Align::Center);
+                    self.rounded(chip, self.px(3.0), th().warning);
+                    self.bold(chip, "USB", 8.0, ink_on(th().warning), Align::Center);
                     rest
                 }
                 false => text_area,
             };
             self.label(text_area, name, 12.0, side_ink(active), Align::Left);
             self.hit(row, control);
+            y += row_h;
+        }
+
+        // While DJing: what fits the track playing, and what has been played.
+        let views = [
+            (SideView::Matching, Filter::Matching, "Matching".to_string()),
+            (
+                SideView::History,
+                Filter::History,
+                format!("History  ({})", browser.history.len()),
+            ),
+        ];
+        for (view, filter, name) in views {
+            if y + row_h > bottom {
+                break;
+            }
+            let row = Area::new(area.x, y, area.width, row_h);
+            let active = browser.filter == filter;
+            self.side_row(row, active, false);
+            let text_area = Area::new(row.x + pad, row.y, row.width - 2.0 * pad, row.height);
+            let text_area = match view {
+                SideView::Matching => {
+                    let (chip, rest) = text_area.split_left(self.px(28.0), self.px(6.0));
+                    let chip = Area::new(
+                        chip.x,
+                        chip.y + self.px(4.0),
+                        chip.width,
+                        chip.height - self.px(8.0),
+                    );
+                    let fill = match browser.matching.is_some() {
+                        true => th().loops,
+                        false => th().dim_text,
+                    };
+                    self.rounded(chip, self.px(3.0), fill);
+                    self.bold(chip, "MIX", 8.0, ink_on(fill), Align::Center);
+                    rest
+                }
+                SideView::History => text_area,
+            };
+            self.label(text_area, name, 12.0, side_ink(active), Align::Left);
+            self.hit(row, Control::BrowserView(view));
             y += row_h;
         }
 
@@ -150,7 +217,7 @@ impl Painter {
                 self.px(20.0),
                 row_h - self.px(4.0),
             );
-            self.button(plus, "+", false, TEXT, UiAction::NewCollection(kind));
+            self.button(plus, "+", false, th().text, UiAction::NewCollection(kind));
             y += row_h;
             for (index, collection) in browser.collections.iter().enumerate() {
                 if collection.kind != kind || y + row_h > bottom {
@@ -164,7 +231,7 @@ impl Painter {
                 let (count, name_area) = text_area.split_right(self.px(36.0), self.px(4.0));
                 match v.naming {
                     Some((id, text)) if id == collection.id => {
-                        self.label(name_area, format!("{text}▏"), 12.0, TEXT, Align::Left)
+                        self.label(name_area, format!("{text}▏"), 12.0, th().text, Align::Left)
                     }
                     _ => {
                         self.label(
@@ -178,7 +245,7 @@ impl Painter {
                             count,
                             format!("{}", collection.count),
                             10.0,
-                            SOFT_TEXT,
+                            th().soft_text,
                             Align::Right,
                         );
                     }
@@ -199,8 +266,8 @@ impl Painter {
             row.height - self.px(2.0),
         );
         match (drop_target, active) {
-            (true, _) => self.rounded(inset, r, DECK_COLORS[0].with_alpha(0.5)),
-            (false, true) => self.rounded(inset, r, SELECTED_ROW),
+            (true, _) => self.rounded(inset, r, th().decks[0].with_alpha(0.5)),
+            (false, true) => self.rounded(inset, r, th().selected_row),
             (false, false) => {}
         }
     }
@@ -217,16 +284,16 @@ impl Painter {
                     search.y,
                     search.width,
                     search.height,
-                    DECK_COLORS[0],
+                    th().decks[0],
                 )
                 .rounded(self.px(3.0))
                 .stroke(self.px(1.0)),
             );
         }
         let (text, color) = match (browser.search.is_empty(), browser.search_focused) {
-            (true, false) => ("Search  ( / )".to_string(), DIM_TEXT),
-            (_, true) => (format!("{}▏", browser.search), TEXT),
-            (false, false) => (browser.search.clone(), TEXT),
+            (true, false) => ("Search  ( / )".to_string(), th().dim_text),
+            (_, true) => (format!("{}▏", browser.search), th().text),
+            (false, false) => (browser.search.clone(), th().text),
         };
         self.label(
             search.inset_x(self.px(10.0)),
@@ -245,14 +312,14 @@ impl Painter {
                 button,
                 &label,
                 false,
-                DECK_COLORS[deck.index()],
+                th().decks[deck.index()],
                 UiAction::LoadSelected(deck),
             );
             rest = after;
         }
         rest = Area::new(rest.x + gap, rest.y, rest.width - gap, rest.height);
         let (rescan, after) = rest.split_left(self.px(70.0), gap);
-        self.button(rescan, "RESCAN", false, TEXT, UiAction::Rescan);
+        self.button(rescan, "RESCAN", false, th().text, UiAction::Rescan);
         rest = after;
         // Viewing a crate or playlist: manage it.
         if browser.filter.collection_id().is_some() {
@@ -272,28 +339,58 @@ impl Painter {
             }
             for (label, on, action) in actions {
                 let (button, after) = rest.split_left(self.px(62.0), gap);
-                self.tinted_button(button, label, on, SOFT_TEXT, action);
+                self.tinted_button(button, label, on, th().soft_text, action);
                 rest = after;
             }
         }
         let counts = format!("{} of {} tracks", browser.len(), browser.total());
-        let status = match browser.status.is_empty() {
+        let mut status = match browser.status.is_empty() {
             true => counts,
             false => format!("{}  ·  {counts}", browser.status),
         };
+        if browser.filter == Filter::Matching {
+            rest = Area::new(rest.x + gap, rest.y, rest.width - gap, rest.height);
+            let (tolerance, after) = rest.split_left(self.px(62.0), gap);
+            let label = format!("±{:.0}%", browser.match_tolerance * 100.0);
+            self.tinted_button(
+                tolerance,
+                &label,
+                false,
+                th().loops,
+                UiAction::MatchTolerance,
+            );
+            rest = after;
+            status = match &browser.matching {
+                Some(m) if m.bpm.is_none() && m.key.is_none() => {
+                    format!("Waiting for {}'s tempo and key", m.title)
+                }
+                Some(m) => {
+                    let bpm = m
+                        .bpm
+                        .map(|b| format!("  ·  {b:.1} BPM"))
+                        .unwrap_or_default();
+                    let key = m
+                        .key
+                        .map(|k| format!("  ·  {}", k.name(v.notation)))
+                        .unwrap_or_default();
+                    format!("Fits {}{bpm}{key}  ·  {} tracks", m.title, browser.len())
+                }
+                None => "Play a track to see what fits it".to_string(),
+            };
+        }
         let status_area = Area::new(
             rest.x + gap,
             rest.y,
             (rest.width - gap).max(0.0),
             rest.height,
         );
-        self.label(status_area, status, 10.0, SOFT_TEXT, Align::Right);
+        self.label(status_area, status, 10.0, th().soft_text, Align::Right);
     }
 
     fn track_table(&mut self, v: &BrowserView<'_>, area: Area) -> usize {
         let browser = v.browser;
         let row_h = self.px(22.0);
-        let playlist = browser.filter.is_playlist();
+        let playlist = browser.filter.is_ordered();
         let badge_w = self.px(28.0);
         let number_w = match playlist {
             true => self.px(34.0),
@@ -322,7 +419,7 @@ impl Painter {
         ];
         let cell_pad = self.px(8.0);
         let (header, list) = area.split_top(self.px(20.0), 0.0);
-        self.rounded(header, self.px(3.0), WELL);
+        self.rounded(header, self.px(3.0), th().well);
         let mut x = header.x;
         for (label, w, column, align) in columns {
             let cell = Area::new(x, header.y, w, header.height);
@@ -334,8 +431,8 @@ impl Painter {
                     (false, _) => "",
                 };
                 let ink = match active {
-                    true => TEXT,
-                    false => SOFT_TEXT,
+                    true => th().text,
+                    false => th().soft_text,
                 };
                 self.bold(
                     cell.inset_x(cell_pad / 2.0),
@@ -363,11 +460,11 @@ impl Painter {
             let is_selected = Some(row_index) == selected;
             match (is_selected, offset % 2) {
                 (true, _) => {
-                    self.rounded(row, self.px(3.0), SELECTED_ROW);
-                    let accent = DECK_COLORS[v.selected_deck.index()];
+                    self.rounded(row, self.px(3.0), th().selected_row);
+                    let accent = th().decks[v.selected_deck.index()];
                     self.fill(Area::new(row.x, row.y, self.px(2.0), row.height), accent);
                 }
-                (false, 1) => self.fill(row, Color::rgba(1.0, 1.0, 1.0, 0.012)),
+                (false, 1) => self.fill(row, th().row_stripe),
                 (false, _) => {}
             }
             // Which deck it is on.
@@ -380,22 +477,36 @@ impl Painter {
                         self.px(16.0),
                         row.height - self.px(8.0),
                     );
-                    let color = DECK_COLORS[deck.index()];
+                    let color = th().decks[deck.index()];
                     self.rounded(chip, self.px(3.0), color);
                     self.bold(chip, deck_letter(deck), 9.0, ink_on(color), Align::Center);
                 }
+            }
+            let played = browser.was_played(track.id);
+            let on_deck = v.loaded.contains(&Some(track.id));
+            if played && !on_deck {
+                let mark = Area::new(x, row.y, badge_w, row.height);
+                self.bold(mark, "✓", 11.0, th().loops.with_alpha(0.8), Align::Center);
             }
             x += badge_w;
             if playlist {
                 if let Some(position) = browser.playlist_position(track.id) {
                     let cell = Area::new(x, row.y, number_w, row.height).inset_x(cell_pad / 2.0);
-                    self.label(cell, format!("{position}"), 11.0, SOFT_TEXT, Align::Right);
+                    self.label(
+                        cell,
+                        format!("{position}"),
+                        11.0,
+                        th().soft_text,
+                        Align::Right,
+                    );
                 }
                 x += number_w;
             }
-            let ink = match is_selected {
-                true => Color::rgb(0.95, 0.95, 0.97),
-                false => TEXT,
+            // Played tracks are dimmed, so the ones still to play stand out.
+            let ink = match (is_selected, played) {
+                (true, _) => th().strong_text,
+                (false, true) => th().soft_text,
+                (false, false) => th().text,
             };
             let cell = |x: f32, w: f32| Area::new(x, row.y, w, row.height).inset_x(cell_pad / 2.0);
             self.label(
@@ -410,7 +521,7 @@ impl Painter {
                 cell(x, artist_w),
                 track.artist.clone().unwrap_or_default(),
                 12.0,
-                SOFT_TEXT,
+                th().soft_text,
                 Align::Left,
             );
             x += artist_w;
@@ -441,7 +552,13 @@ impl Painter {
                             Align::Center,
                         );
                     }
-                    false => self.bold(chip, key.name(v.notation), 10.0, fill, Align::Center),
+                    false => self.bold(
+                        chip,
+                        key.name(v.notation),
+                        10.0,
+                        readable(fill),
+                        Align::Center,
+                    ),
                 }
             }
             x += key_w;
@@ -454,7 +571,7 @@ impl Painter {
                         .to_string()
                 })
                 .unwrap_or_default();
-            self.label(cell(x, time_w), time, 12.0, SOFT_TEXT, Align::Right);
+            self.label(cell(x, time_w), time, 12.0, th().soft_text, Align::Right);
             self.hit(row, Control::BrowserRow(row_index));
         }
         if browser.total() == 0 {
@@ -465,7 +582,7 @@ impl Painter {
                 line.inset_x(cell_pad),
                 message,
                 12.0,
-                SOFT_TEXT,
+                th().soft_text,
                 Align::Left,
             );
         }
@@ -475,7 +592,7 @@ impl Painter {
 
 fn side_ink(active: bool) -> Color {
     match active {
-        true => Color::rgb(0.95, 0.95, 0.97),
-        false => TEXT,
+        true => th().strong_text,
+        false => th().text,
     }
 }
