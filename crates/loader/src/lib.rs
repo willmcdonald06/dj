@@ -5,7 +5,8 @@
 //! per load, and passes each track to the engine through its [`TrackSender`] as soon as
 //! the first audio is decoded (decoding then continues in the background). A new load
 //! onto a deck cancels the previous one still decoding for that deck. Once decoded, the
-//! track is analysed (waveform summary and kick markers) on the same worker thread.
+//! track is analysed (waveform summary and kick markers) on the same worker thread,
+//! and then its stems are loaded if it has a stems file (see [`stems`]).
 //!
 //! # Freeing tracks off the audio thread
 //!
@@ -18,6 +19,7 @@
 
 mod decode;
 mod resample;
+pub mod stems;
 
 pub use decode::{DecodeStats, FileTags, LoadError, TrackInfo, decode_file, read_tags};
 
@@ -43,6 +45,7 @@ pub fn analyze_file(
     Ok(dj_analysis::analyze(&track))
 }
 pub use resample::{ResampleError, StereoResampler};
+pub use stems::{LoadedStems, STEMS_SUFFIX, is_stems_file, load_stems, stems_path};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +55,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use dj_analysis::TrackAnalysis;
-use dj_engine::{DeckId, Track, TrackId, TrackSender};
+use dj_engine::{DeckId, StemSet, Track, TrackId, TrackLoad, TrackSender};
 
 /// How often the manager checks for tracks it can free when nothing else happens.
 const COLLECT_INTERVAL: Duration = Duration::from_millis(250);
@@ -74,6 +77,23 @@ pub enum LoadEvent {
         id: TrackId,
         analysis: Arc<TrackAnalysis>,
         elapsed: Duration,
+    },
+    /// The track's stems are on the deck.
+    StemsLoaded {
+        deck: DeckId,
+        id: TrackId,
+        /// Memory the compressed stems take.
+        bytes: usize,
+        /// Stem frames ahead of the track.
+        offset: i64,
+        residual_db: f32,
+        elapsed: Duration,
+    },
+    /// The track has a stems file but it couldn't be used.
+    StemsFailed {
+        deck: DeckId,
+        id: TrackId,
+        error: String,
     },
     /// Decoding finished.
     Finished {
@@ -107,6 +127,11 @@ enum Message {
         analysis: Arc<TrackAnalysis>,
         elapsed: Duration,
     },
+    Stems {
+        deck: DeckId,
+        id: TrackId,
+        result: Result<(Arc<StemSet>, LoadedInfo), String>,
+    },
     Done {
         deck: DeckId,
         id: TrackId,
@@ -114,6 +139,13 @@ enum Message {
         result: Result<DecodeStats, LoadError>,
     },
     Shutdown,
+}
+
+/// What [`LoadEvent::StemsLoaded`] reports, without the stems.
+struct LoadedInfo {
+    offset: i64,
+    residual_db: f32,
+    elapsed: Duration,
 }
 
 /// Handle to the loader thread. Dropping it stops the thread.
@@ -138,6 +170,7 @@ impl Loader {
             next_id: 1,
             jobs: [None, None],
             held: Vec::new(),
+            held_stems: Vec::new(),
         };
         let thread = std::thread::Builder::new()
             .name("loader".into())
@@ -181,6 +214,32 @@ impl Drop for Loader {
     }
 }
 
+/// Load and check stems for a decoded track. Errors are messages for the UI;
+/// `"cancelled"` means the load was superseded.
+fn load_track_stems(
+    file: &std::path::Path,
+    track: &Track,
+    cancel: &AtomicBool,
+) -> Result<(Arc<StemSet>, LoadedInfo), String> {
+    let loaded = match load_stems(file, track, cancel) {
+        Ok(loaded) => loaded,
+        Err(LoadError::Cancelled) => return Err("cancelled".into()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if loaded.residual_db > stems::MAX_RESIDUAL_DB {
+        return Err(format!(
+            "stems don't match the track ({:.1} dB residual); re-run the analyzer",
+            loaded.residual_db
+        ));
+    }
+    let info = LoadedInfo {
+        offset: loaded.offset,
+        residual_db: loaded.residual_db,
+        elapsed: loaded.elapsed,
+    };
+    Ok((Arc::new(loaded.stems), info))
+}
+
 struct Job {
     id: TrackId,
     cancel: Arc<AtomicBool>,
@@ -198,6 +257,8 @@ struct Manager {
     jobs: [Option<Job>; 2],
     /// Every track handed to the engine and not yet freed.
     held: Vec<Arc<Track>>,
+    /// Likewise for stems.
+    held_stems: Vec<Arc<StemSet>>,
 }
 
 impl Manager {
@@ -233,8 +294,8 @@ impl Manager {
                     return;
                 }
                 self.held.push(Arc::clone(&track));
-                if let Err(load) = self.tracks.send(deck, track) {
-                    tracing::error!("engine track queue full; dropping load of {:?}", load.deck);
+                if self.tracks.send(deck, track).is_err() {
+                    tracing::error!("engine track queue full; dropping load of {deck:?}");
                     return;
                 }
                 self.emit(LoadEvent::Loaded {
@@ -258,6 +319,31 @@ impl Manager {
                         elapsed,
                     });
                 }
+            }
+            Message::Stems { deck, id, result } => {
+                if !self.is_current(deck, id) {
+                    return;
+                }
+                let event = match result {
+                    Ok((stems, info)) => {
+                        let bytes = stems.compressed_bytes();
+                        self.held_stems.push(Arc::clone(&stems));
+                        if let Err(TrackLoad::Stems { .. }) = self.tracks.send_stems(deck, stems) {
+                            tracing::error!("engine track queue full; dropping stems");
+                            return;
+                        }
+                        LoadEvent::StemsLoaded {
+                            deck,
+                            id,
+                            bytes,
+                            offset: info.offset,
+                            residual_db: info.residual_db,
+                            elapsed: info.elapsed,
+                        }
+                    }
+                    Err(error) => LoadEvent::StemsFailed { deck, id, error },
+                };
+                self.emit(event);
             }
             Message::Done {
                 deck,
@@ -319,6 +405,13 @@ impl Manager {
                             elapsed: started.elapsed(),
                         });
                     }
+                    let stems_file = stems_path(&path);
+                    if !cancel.load(Ordering::Relaxed) && stems_file.is_file() {
+                        let result = load_track_stems(&stems_file, &track, &cancel);
+                        if !matches!(&result, Err(e) if e == "cancelled") {
+                            let _ = outbox.send(Message::Stems { deck, id, result });
+                        }
+                    }
                 }
                 let _ = outbox.send(Message::Done {
                     deck,
@@ -337,9 +430,10 @@ impl Manager {
         matches!(&self.jobs[deck.index()], Some(job) if job.id == id)
     }
 
-    /// Free tracks that only we still hold.
+    /// Free tracks and stems that only we still hold.
     fn collect(&mut self) {
         self.held.retain(|track| Arc::strong_count(track) > 1);
+        self.held_stems.retain(|stems| Arc::strong_count(stems) > 1);
     }
 
     fn emit(&self, event: LoadEvent) {

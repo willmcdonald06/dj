@@ -234,22 +234,24 @@ impl Sink {
 }
 
 /// An open file: demuxer plus decoder for its default audio track.
-struct Source {
+pub(crate) struct Source {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
-    sample_rate: u32,
-    channels: usize,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: usize,
     /// Playable frames, if the file declares them.
-    frames: Option<u64>,
+    pub(crate) frames: Option<u64>,
     title: Option<String>,
     artist: Option<String>,
+    /// The first comment tag.
+    pub(crate) comment: Option<String>,
     planar: Vec<Vec<f32>>,
     skipped_packets: u64,
 }
 
 impl Source {
-    fn open(path: &Path) -> Result<Self, LoadError> {
+    pub(crate) fn open(path: &Path) -> Result<Self, LoadError> {
         let file = File::open(path)?;
         let stream = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
@@ -283,9 +285,12 @@ impl Source {
             .make_audio_decoder(params, &AudioDecoderOptions::default())
             .map_err(|err| LoadError::Codec(err.to_string()))?;
 
-        let (title, artist) = match format.metadata().skip_to_latest() {
-            Some(revision) => title_and_artist(revision),
-            None => (None, None),
+        let (title, artist, comment) = match format.metadata().skip_to_latest() {
+            Some(revision) => {
+                let (title, artist) = title_and_artist(revision);
+                (title, artist, comment(revision))
+            }
+            None => (None, None, None),
         };
 
         Ok(Self {
@@ -297,6 +302,7 @@ impl Source {
             frames,
             title,
             artist,
+            comment,
             planar: Vec::new(),
             skipped_packets: 0,
         })
@@ -310,15 +316,35 @@ impl Source {
         right: &mut Vec<f32>,
     ) -> Result<bool, LoadError> {
         loop {
+            let Some(planar) = self.next_planar()? else {
+                return Ok(false);
+            };
+            let (l, r) = match planar {
+                [] => continue,
+                [mono] => (mono, mono),
+                [l, r, ..] => (l, r),
+            };
+            left.clear();
+            left.extend_from_slice(l);
+            right.clear();
+            right.extend_from_slice(r);
+            return Ok(true);
+        }
+    }
+
+    /// Decode the next packet into one `Vec` per channel. `None` at the end of the
+    /// file.
+    pub(crate) fn next_planar(&mut self) -> Result<Option<&[Vec<f32>]>, LoadError> {
+        loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(packet)) => packet,
-                Ok(None) => return Ok(false),
+                Ok(None) => return Ok(None),
                 // A new chained stream (e.g. in Ogg) starts; treat it as the end.
-                Err(SymphoniaError::ResetRequired) => return Ok(false),
+                Err(SymphoniaError::ResetRequired) => return Ok(None),
                 Err(SymphoniaError::IoError(err))
                     if err.kind() == std::io::ErrorKind::UnexpectedEof =>
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(err) => return Err(LoadError::Decode(err.to_string())),
             };
@@ -338,16 +364,7 @@ impl Source {
                 continue;
             }
             decoded.copy_to_vecs_planar::<f32>(&mut self.planar);
-            let (l, r) = match self.planar.as_slice() {
-                [] => continue,
-                [mono] => (mono, mono),
-                [l, r, ..] => (l, r),
-            };
-            left.clear();
-            left.extend_from_slice(l);
-            right.clear();
-            right.extend_from_slice(r);
-            return Ok(true);
+            return Ok(Some(self.planar.as_slice()));
         }
     }
 }
@@ -395,6 +412,19 @@ fn album(revision: &MetadataRevision) -> Option<String> {
             _ => None,
         })
         .filter(|a| !a.is_empty())
+}
+
+fn comment(revision: &MetadataRevision) -> Option<String> {
+    let mut tags = revision.media.tags.iter().chain(
+        revision
+            .per_track
+            .iter()
+            .flat_map(|t| t.metadata.tags.iter()),
+    );
+    tags.find_map(|tag| match &tag.std {
+        Some(StandardTag::Comment(value)) => Some(value.trim().to_string()),
+        _ => None,
+    })
 }
 
 fn title_and_artist(revision: &MetadataRevision) -> (Option<String>, Option<String>) {

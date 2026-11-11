@@ -30,6 +30,7 @@ use dj_stretch::TimeStretcher;
 
 use crate::cues::{HOT_CUES, HotCue, LoopRegion, PendingWraps};
 use crate::grid::{BeatGrid, wrap_half};
+use crate::stems::{Stem, StemPlayer, StemSet, StemsSnapshot};
 use crate::track::{Track, TrackId};
 
 /// Fade time for starts, stops and jumps.
@@ -40,6 +41,11 @@ pub const NUDGE_DECAY_SECONDS: f32 = 0.1;
 pub const NUDGE_MAX: f32 = 0.3;
 /// Frames rendered between checks for pending jumps and rate changes.
 pub const SUB_BLOCK: usize = 64;
+/// How closely a scratch follows the hand: the playhead chases the platter with this
+/// time constant, which smooths jog ticks and mouse moves into a continuous speed.
+pub const SCRATCH_SMOOTHING_SECONDS: f64 = 0.012;
+/// Fastest scratch, either way, as a multiple of normal speed.
+pub const SCRATCH_MAX_RATE: f64 = 8.0;
 /// Fastest playback the deck supports (tempo +50% plus a full nudge, with headroom).
 const MAX_RATE: f64 = 2.0;
 const MAX_INPUT: usize = (SUB_BLOCK as f64 * MAX_RATE) as usize + 2;
@@ -186,6 +192,26 @@ pub enum DeckAction {
     /// (or is the master). See the engine's `sync` module for the rules.
     SetSyncLock(bool),
     ToggleSyncLock,
+    /// Mute or unmute one stem. Works before the stems have loaded: they start muted.
+    SetStemMuted {
+        stem: Stem,
+        muted: bool,
+    },
+    ToggleStem(Stem),
+    /// Hand on the platter (jog top touched, or the waveform grabbed): from now on the
+    /// track moves only as the platter does, like a record held under the hand, and
+    /// pitch follows speed even with key lock on.
+    ScratchStart,
+    /// The platter moved by this much track time (negative is backwards).
+    ScratchMove {
+        seconds: f32,
+    },
+    /// Hand off the platter: a playing deck carries on at its tempo; a stopped one
+    /// stays where it was left.
+    ScratchEnd,
+    /// Play only this stem (an acapella, say); if it already plays alone, bring all
+    /// the stems back.
+    SoloStem(Stem),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -243,6 +269,9 @@ pub struct DeckSnapshot {
     pub loop_in: Option<f64>,
     /// While rolling: where the track would be without the roll.
     pub slip_position: Option<f64>,
+    pub stems: StemsSnapshot,
+    /// A hand is on the platter.
+    pub scratching: bool,
 }
 
 impl Default for DeckSnapshot {
@@ -269,6 +298,8 @@ impl Default for DeckSnapshot {
             loop_active: false,
             loop_in: None,
             slip_position: None,
+            stems: StemsSnapshot::default(),
+            scratching: false,
         }
     }
 }
@@ -329,6 +360,12 @@ pub struct Deck {
     block_ready: u64,
     block_len: u64,
     block_complete: bool,
+    stems: StemPlayer,
+    /// Where the hand has put the platter, while it is on it.
+    scratch: Option<f64>,
+    /// Playing in scratch mode (varispeed, rate from the hand). Trails `scratch` while
+    /// key lock fades between the stretcher and varispeed.
+    scratching: bool,
 }
 
 impl Deck {
@@ -373,6 +410,9 @@ impl Deck {
             block_ready: 0,
             block_len: 0,
             block_complete: false,
+            stems: StemPlayer::new(sample_rate),
+            scratch: None,
+            scratching: false,
         }
     }
 
@@ -396,6 +436,18 @@ impl Deck {
         self.loop_in = None;
         self.slip = None;
         self.wraps.clear();
+        self.stems.reset();
+        self.scratch = None;
+        self.scratching = false;
+    }
+
+    /// Stems for a loaded track; ignored unless that track is still loaded. The
+    /// replaced set's `Arc` is only decremented here: the loader frees sets.
+    pub fn set_stems(&mut self, set: Arc<StemSet>) {
+        let loaded = self.track.as_ref().map(|track| track.id());
+        if loaded == Some(set.track()) && self.stems.track() != Some(set.track()) {
+            self.stems.attach(set);
+        }
     }
 
     pub fn apply(&mut self, action: DeckAction) {
@@ -542,6 +594,32 @@ impl Deck {
                     self.grid = grid;
                 }
             }
+            DeckAction::SetStemMuted { stem, muted } => self.stems.set_muted(stem, muted),
+            DeckAction::ToggleStem(stem) => {
+                let muted = !self.stems.is_muted(stem);
+                self.stems.set_muted(stem, muted);
+            }
+            DeckAction::SoloStem(stem) => self.stems.solo(stem),
+            DeckAction::ScratchStart => {
+                self.pending_seek = None;
+                self.scratch = Some(self.position);
+                // Without key lock (or while silent) there is nothing to fade between.
+                if !self.key_lock || self.gain == 0.0 {
+                    self.scratching = true;
+                }
+            }
+            DeckAction::ScratchMove { seconds } => {
+                if let Some(target) = &mut self.scratch {
+                    let max = track.len_frames().saturating_sub(1) as f64;
+                    *target = (*target + seconds as f64 * self.sample_rate as f64).clamp(0.0, max);
+                }
+            }
+            DeckAction::ScratchEnd => {
+                self.scratch = None;
+                if !self.key_lock {
+                    self.scratching = false;
+                }
+            }
             DeckAction::SetTempo { .. }
             | DeckAction::SetTempoRange(_)
             | DeckAction::CycleTempoRange
@@ -672,6 +750,8 @@ impl Deck {
             loop_active: self.loop_active,
             loop_in: self.loop_in,
             slip_position: self.slip.map(|s| s.position),
+            stems: self.stems.snapshot(),
+            scratching: self.scratch.is_some(),
             ..DeckSnapshot::default()
         };
         match &self.track {
@@ -707,12 +787,15 @@ impl Deck {
     fn render_sub_block(&mut self, left: &mut [f32], right: &mut [f32]) {
         let n = left.len().min(right.len());
         self.nudge *= self.nudge_decay.powi(n as i32);
-        let moving = self.transport.is_moving();
+        let moving = self.transport.is_moving() || self.scratch.is_some();
+        // Entering or leaving scratch mode under key lock fades out first.
+        let switching_scratch = self.scratch.is_some() != self.scratching;
         if self.track.is_none() {
             left.fill(0.0);
             right.fill(0.0);
             return;
         }
+        self.stems.begin(n);
 
         if self.gain == 0.0 {
             if let Some(to) = self.pending_seek.take() {
@@ -720,6 +803,9 @@ impl Deck {
             }
             if let Some(on) = self.pending_key_lock.take() {
                 self.key_lock = on;
+            }
+            if switching_scratch {
+                self.scratching = self.scratch.is_some();
             }
             if !moving {
                 left.fill(0.0);
@@ -730,18 +816,35 @@ impl Deck {
             self.restart_stretcher = true;
         }
 
-        let rate = (self.tempo_rate() + self.nudge + self.phase_correction)
-            .clamp(0.0, MAX_RATE as f32 - 0.01) as f64;
-        let advance = match self.key_lock {
+        self.keep_in_loop();
+        let rate = match (self.scratching, self.scratch) {
+            // Chase the hand: the speed that closes the gap in the smoothing time.
+            (true, Some(target)) => {
+                let lag = SCRATCH_SMOOTHING_SECONDS * self.sample_rate as f64;
+                ((target - self.position) / lag).clamp(-SCRATCH_MAX_RATE, SCRATCH_MAX_RATE)
+            }
+            _ => (self.tempo_rate() + self.nudge + self.phase_correction)
+                .clamp(0.0, MAX_RATE as f32 - 0.01) as f64,
+        };
+        let advance = match self.key_lock && !self.scratching {
             true => self.read_stretched(&mut left[..n], &mut right[..n], rate),
             false => self.read_varispeed(&mut left[..n], &mut right[..n], rate),
         };
+        if self.scratching {
+            let max = self.block_len.saturating_sub(1) as f64;
+            self.position = self.position.clamp(0.0, max);
+            // The stretcher's input is stale once the hand has moved the track.
+            self.restart_stretcher = true;
+        }
         // While rolling, the track carries on underneath.
         if let Some(slip) = &mut self.slip {
             slip.position += advance;
         }
 
-        let target = match moving && self.pending_seek.is_none() && self.pending_key_lock.is_none()
+        let target = match moving
+            && self.pending_seek.is_none()
+            && self.pending_key_lock.is_none()
+            && !(switching_scratch && self.key_lock)
         {
             true => 1.0,
             false => 0.0,
@@ -758,7 +861,7 @@ impl Deck {
             self.peak = self.peak.max(l.abs()).max(r.abs());
         }
 
-        if self.block_complete && self.position >= self.block_len as f64 {
+        if self.block_complete && !self.scratching && self.position >= self.block_len as f64 {
             self.transport = Transport::Stopped;
             self.position = self.block_len as f64;
             self.pending_seek = None;
@@ -780,8 +883,14 @@ impl Deck {
             return 0.0;
         };
         let active = self.active_loop();
-        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            (*l, *r) = read_interpolated(track, self.position, self.block_ready);
+        let mut source = Source {
+            track,
+            ready: self.block_ready,
+            stems: &mut self.stems,
+        };
+        let step = 1.0 / left.len().max(1) as f32;
+        for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+            (*l, *r) = read_interpolated(&mut source, self.position, i as f32 * step);
             let before = self.position;
             self.position += rate;
             if let Some(region) = active {
@@ -806,10 +915,14 @@ impl Deck {
         let count = (wanted.floor() as usize).min(MAX_INPUT);
         self.input_carry = wanted - count as f64;
         let [in_l, in_r] = &mut self.input;
-        fill_looped(
+        let mut source = Source {
             track,
+            ready: self.block_ready,
+            stems: &mut self.stems,
+        };
+        fill_looped(
+            &mut source,
             self.read_position,
-            self.block_ready,
             active,
             &mut in_l[..count],
             &mut in_r[..count],
@@ -853,21 +966,74 @@ impl Deck {
         // `position`.
         let input_latency = self.stretcher.input_latency() as f64;
         let output_latency = self.stretcher.output_latency() as f64 * rate;
+        // `end` counts input frames from the playhead without wrapping; inside a loop
+        // the input wraps (perhaps several times, for a loop shorter than the
+        // stretcher's look-ahead) and the playhead must wrap as often after it.
         let end = (self.position + output_latency + input_latency).round() as i64;
+        let wrap = self
+            .active_loop()
+            .filter(|region| self.position < region.end)
+            .map(|region| (region.start.round() as i64, region.end.round() as i64));
+        let map = |frame: i64| match wrap {
+            Some((start, loop_end)) if frame >= loop_end => {
+                start + (frame - loop_end).rem_euclid(loop_end - start)
+            }
+            _ => frame,
+        };
         let [pre_l, pre_r] = &mut self.preroll;
         let length = pre_l.len();
-        fill_from_track(track, end - length as i64, self.block_ready, pre_l, pre_r);
+        let mut source = Source {
+            track,
+            ready: self.block_ready,
+            stems: &mut self.stems,
+        };
+        let step = 1.0 / length.max(1) as f32;
+        for (i, (l, r)) in pre_l.iter_mut().zip(pre_r.iter_mut()).enumerate() {
+            let frame = end - length as i64 + i as i64;
+            (*l, *r) = source.frame(map(frame), i as f32 * step);
+        }
         self.stretcher
             .seek(&pre_l[..length], &pre_r[..length], rate);
-        self.read_position = end;
-        // Starting just before a loop's end: the input is already past it.
-        if let Some(region) = self.active_loop() {
-            let (loop_end, len) = (region.end.round() as i64, region.len().round() as i64);
-            if self.position < region.end && end >= loop_end {
-                self.read_position -= len;
-                self.wraps.push(region.end, len as f64);
+        self.read_position = map(end);
+        if let Some((start, loop_end)) = wrap {
+            if end >= loop_end {
+                let len = loop_end - start;
+                let count = (end - loop_end) / len + 1;
+                for _ in 0..count {
+                    self.wraps.push(loop_end as f64, len as f64);
+                }
             }
         }
+    }
+
+    /// Make sure an active loop actually holds playback. A loop can be set behind the
+    /// playhead (quantize snaps its start to the nearest beat, which may be past) or,
+    /// under key lock, after the stretcher has already read past its end (it reads
+    /// ahead of what you hear); either way the wrap would be missed. Then jump, with
+    /// the usual fade, to where the loop would have the playhead, which also re-primes
+    /// the stretcher with looped input.
+    fn keep_in_loop(&mut self) {
+        let Some(region) = self.active_loop() else {
+            return;
+        };
+        if self.pending_seek.is_some() || self.gain == 0.0 && self.restart_stretcher {
+            return;
+        }
+        let missed_heard = self.position >= region.end && self.wraps.front().is_none();
+        let missed_input = self.key_lock
+            && !self.scratching
+            && !self.restart_stretcher
+            && self.read_position >= region.end.round() as i64;
+        if !(missed_heard || missed_input) {
+            return;
+        }
+        let rate = (self.tempo_rate() + self.nudge + self.phase_correction) as f64;
+        let landing = self.position + self.jump_delay() * rate;
+        let target = match landing >= region.start {
+            true => region.start + (landing - region.start).rem_euclid(region.len()),
+            false => landing,
+        };
+        self.jump(target);
     }
 
     /// Frames per beat: from the grid, or 120 BPM without one.
@@ -1068,65 +1234,73 @@ struct Slip {
     saved_active: bool,
 }
 
+/// Where a deck's frames come from: the decoded track, with muted stems taken out.
+struct Source<'a> {
+    track: &'a Track,
+    /// Frames decoded so far (later ones read as silence).
+    ready: u64,
+    stems: &'a mut StemPlayer,
+}
+
+impl Source<'_> {
+    /// Frame `index`; `t` (0..1) is where it falls in the stem gain ramp.
+    #[inline]
+    fn frame(&mut self, index: i64, t: f32) -> (f32, f32) {
+        if index < 0 || index as u64 >= self.ready {
+            return (0.0, 0.0);
+        }
+        let mix = self.track.frame_unchecked_ready(index as u64);
+        self.stems.apply(index, t, mix)
+    }
+}
+
 /// Like [`fill_from_track`], but frames at or past the end of `loop_region` come from
 /// its start again (only when the read starts before the end).
 fn fill_looped(
-    track: &Track,
+    source: &mut Source<'_>,
     start: i64,
-    ready: u64,
     loop_region: Option<LoopRegion>,
     left: &mut [f32],
     right: &mut [f32],
 ) {
     let Some(region) = loop_region else {
-        fill_from_track(track, start, ready, left, right);
+        fill_from_track(source, start, left, right);
         return;
     };
     let (end, len) = (region.end.round() as i64, region.len().round() as i64);
+    let step = 1.0 / left.len().max(1) as f32;
     for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
         let mut frame = start + i as i64;
         if start < end && frame >= end {
             frame -= len;
         }
-        (*l, *r) = match frame >= 0 && (frame as u64) < ready {
-            true => track.frame_unchecked_ready(frame as u64),
-            false => (0.0, 0.0),
-        };
+        (*l, *r) = source.frame(frame, i as f32 * step);
     }
 }
 
-/// Copy frames `start..start + out.len()` of `track` into `left`/`right`; frames before
-/// the start, past `ready` or past the end are silence.
-fn fill_from_track(track: &Track, start: i64, ready: u64, left: &mut [f32], right: &mut [f32]) {
+/// Copy frames `start..start + out.len()` of `source` into `left`/`right`; frames
+/// before the start, past `ready` or past the end are silence.
+fn fill_from_track(source: &mut Source<'_>, start: i64, left: &mut [f32], right: &mut [f32]) {
+    let step = 1.0 / left.len().max(1) as f32;
     for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
-        let frame = start + i as i64;
-        (*l, *r) = match frame >= 0 && (frame as u64) < ready {
-            true => track.frame_unchecked_ready(frame as u64),
-            false => (0.0, 0.0),
-        };
+        (*l, *r) = source.frame(start + i as i64, i as f32 * step);
     }
 }
 
 /// Read the frame at fractional `position` with 4-point cubic (Catmull-Rom)
-/// interpolation. Frames not decoded yet (at or past `ready`) read as silence.
+/// interpolation. Frames not decoded yet read as silence.
 #[inline]
-fn read_interpolated(track: &Track, position: f64, ready: u64) -> (f32, f32) {
+fn read_interpolated(source: &mut Source<'_>, position: f64, t: f32) -> (f32, f32) {
     let index = position.floor();
     let frac = (position - index) as f32;
     let index = index as i64;
-    let frame = |i: i64| -> (f32, f32) {
-        match i >= 0 && (i as u64) < ready {
-            true => track.frame_unchecked_ready(i as u64),
-            false => (0.0, 0.0),
-        }
-    };
-    let y1 = frame(index);
+    let y1 = source.frame(index, t);
     if frac == 0.0 {
         return y1;
     }
-    let y0 = frame(index - 1);
-    let y2 = frame(index + 1);
-    let y3 = frame(index + 2);
+    let y0 = source.frame(index - 1, t);
+    let y2 = source.frame(index + 1, t);
+    let y3 = source.frame(index + 2, t);
     (
         catmull_rom(y0.0, y1.0, y2.0, y3.0, frac),
         catmull_rom(y0.1, y1.1, y2.1, y3.1, frac),
@@ -1600,6 +1774,80 @@ mod tests {
             .collect()
     }
 
+    /// Move the platter by `seconds` spread evenly over `frames` of rendering (as jog
+    /// ticks arrive), returning the playhead after each 128-frame callback.
+    fn scratch_for(deck: &mut Deck, seconds: f32, frames: usize) -> Vec<u64> {
+        let calls = frames / 128;
+        (0..calls)
+            .map(|_| {
+                deck.apply(DeckAction::ScratchMove {
+                    seconds: seconds / calls as f32,
+                });
+                run(deck, 128);
+                deck.snapshot().position
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scratching_follows_the_platter_smoothly_both_ways() {
+        for key_lock in [false, true] {
+            for playing in [false, true] {
+                let what = format!("key lock {key_lock}, playing {playing}");
+                let mut deck = new_deck(key_lock);
+                deck.load(Some(ramp_track(SR as usize * 20)));
+                deck.apply(DeckAction::JumpTo {
+                    frame: SR as f64 * 5.0,
+                });
+                if playing {
+                    deck.apply(DeckAction::PlayPause);
+                }
+                run(&mut deck, 4_800);
+                deck.apply(DeckAction::ScratchStart);
+                assert!(deck.snapshot().scratching);
+                // Hand held still: the record stops.
+                run(&mut deck, 4_800);
+                let held = deck.snapshot().position;
+                run(&mut deck, 4_800);
+                assert!(
+                    deck.snapshot().position.abs_diff(held) < 50,
+                    "{what}: moved while held"
+                );
+                // Back half a second over half a second, then forward again: the
+                // playhead moves steadily, a callback at a time, never in jumps.
+                let back = scratch_for(&mut deck, -0.5, SR as usize / 2);
+                let forward = scratch_for(&mut deck, 0.5, SR as usize / 2);
+                let path: Vec<u64> = std::iter::once(held).chain(back).chain(forward).collect();
+                let biggest = path.windows(2).map(|w| w[0].abs_diff(w[1])).max().unwrap();
+                assert!(
+                    biggest < 128 * 3,
+                    "{what}: jumped {biggest} frames in one callback"
+                );
+                let lowest = *path.iter().min().unwrap();
+                assert!(
+                    (held - lowest) as f64 > SR as f64 * 0.45,
+                    "{what}: only went back {} frames",
+                    held - lowest
+                );
+                // It makes sound while moving, even on a stopped deck.
+                deck.apply(DeckAction::ScratchMove { seconds: 0.2 });
+                let out = run(&mut deck, 4_800);
+                assert!(out.iter().any(|(l, _)| l.abs() > 1.0), "{what}: silent");
+                // Let go: a playing deck plays on, a stopped one stays.
+                deck.apply(DeckAction::ScratchEnd);
+                run(&mut deck, 4_800);
+                let released = deck.snapshot().position;
+                run(&mut deck, 4_800);
+                let moved = deck.snapshot().position.abs_diff(released);
+                match playing {
+                    true => assert!((moved as i64 - 4_800).abs() < 200, "{what}: {moved}"),
+                    false => assert_eq!(moved, 0, "{what}"),
+                }
+                assert!(!deck.snapshot().scratching);
+            }
+        }
+    }
+
     #[test]
     fn auto_loop_wraps_with_and_without_key_lock() {
         for key_lock in [false, true] {
@@ -1630,6 +1878,52 @@ mod tests {
                 "key lock {key_lock}: still looping"
             );
         }
+    }
+
+    /// Every short loop, set anywhere in the beat, with or without key lock and
+    /// quantize, keeps the playhead inside it.
+    #[test]
+    fn short_loops_hold_wherever_they_are_set() {
+        let mut failures = Vec::new();
+        for key_lock in [false, true] {
+            for quantize in [false, true] {
+                for beats in [0.03125f32, 0.0625, 0.125, 0.25, 0.5, 1.0, 2.0] {
+                    for offset in [0usize, 3_000, 9_000, 13_000, 20_000, 3_001, 9_001, 20_001] {
+                        let mut deck = new_deck(key_lock);
+                        deck.load(Some(ramp_track(600_000)));
+                        deck.set_quantize(quantize);
+                        deck.apply(DeckAction::SetBeatGrid {
+                            track: TrackId(7),
+                            grid: Some(BeatGrid::from_bpm(120.0, 0.0, SR)),
+                        });
+                        deck.apply(DeckAction::PlayPause);
+                        run(&mut deck, 48_000 + offset);
+                        let roll = offset % 2 == 1;
+                        match roll {
+                            true => deck.apply(DeckAction::RollPress { beats }),
+                            false => deck.apply(DeckAction::AutoLoop { beats }),
+                        }
+                        let region = deck.snapshot().loop_region.unwrap();
+                        // Allow the jump fade and the stretcher's latency to settle.
+                        run(&mut deck, 24_000);
+                        let seen = positions(&mut deck, 48_000);
+                        let inside = seen.iter().all(|&p| {
+                            p as f64 >= region.start - 1.0 && (p as f64) < region.end + 1.0
+                        });
+                        if !inside {
+                            failures.push(format!(
+                                "key lock {key_lock}, quantize {quantize}, {beats} beats at +{offset} (roll: {roll})"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "left the loop:\n{}",
+            failures.join("\n")
+        );
     }
 
     #[test]
@@ -1740,6 +2034,83 @@ mod tests {
             "phase {phase} vs {expected}"
         );
         assert!(deck.snapshot().position < 30_000);
+    }
+
+    /// A track that is the sum of four sine stems, and those stems.
+    fn track_with_stems(frames: usize) -> (Arc<Track>, Arc<StemSet>) {
+        let hz = [220.0, 330.0, 550.0, 70.0];
+        let stem =
+            |s: usize, i: usize| 0.2 * (std::f32::consts::TAU * hz[s] * i as f32 / SR as f32).sin();
+        let (track, mut writer) = Track::new(TrackId(7), SR, frames);
+        let mix: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let v: f32 = (0..4).map(|s| stem(s, i)).sum();
+                [v, v]
+            })
+            .collect();
+        writer.push_interleaved(&mix);
+        writer.finish();
+        let stems = std::array::from_fn(|s| {
+            let mut encoder = crate::stem_codec::StemEncoder::new(1.0);
+            let samples: Vec<f32> = (0..frames).map(|i| stem(s, i)).collect();
+            encoder.push(&samples, &samples);
+            encoder.finish()
+        });
+        (track, Arc::new(StemSet::new(TrackId(7), stems, 0)))
+    }
+
+    /// RMS of `out` after the first `skip` frames.
+    fn rms(out: &[(f32, f32)], skip: usize) -> f32 {
+        let tail = &out[skip..];
+        (tail.iter().map(|(l, _)| l * l).sum::<f32>() / tail.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn muting_stems_takes_them_out_with_and_without_key_lock() {
+        for key_lock in [false, true] {
+            let (track, stems) = track_with_stems(SR as usize * 2);
+            let mut deck = new_deck(key_lock);
+            deck.load(Some(track));
+            // Stems for another track are ignored.
+            let (_, other) = track_with_stems(1000);
+            let other = Arc::new(StemSet::new(
+                TrackId(99),
+                [0, 1, 2, 3].map(|s| other.stem(Stem::ALL[s]).clone()),
+                0,
+            ));
+            deck.set_stems(other);
+            assert!(!deck.snapshot().stems.available);
+            deck.set_stems(stems);
+            assert!(deck.snapshot().stems.available);
+            deck.apply(DeckAction::PlayPause);
+            let full = rms(&run(&mut deck, 24_000), 14_400);
+            assert!(full > 0.15, "key lock {key_lock}: {full}");
+            // Four uncorrelated sines of equal level: one alone has half the RMS.
+            deck.apply(DeckAction::SoloStem(Stem::Bass));
+            let solo = rms(&run(&mut deck, 24_000), 14_400);
+            assert!(
+                (solo / full - 0.5).abs() < 0.05,
+                "key lock {key_lock}: {solo} of {full}"
+            );
+            deck.apply(DeckAction::SoloStem(Stem::Bass));
+            let back = rms(&run(&mut deck, 24_000), 14_400);
+            assert!(
+                (back / full - 1.0).abs() < 0.05,
+                "key lock {key_lock}: {back} of {full}"
+            );
+        }
+    }
+
+    #[test]
+    fn loading_a_track_drops_its_stems_and_unmutes() {
+        let (track, stems) = track_with_stems(4800);
+        let mut deck = new_deck(false);
+        deck.load(Some(track));
+        deck.set_stems(stems);
+        deck.apply(DeckAction::ToggleStem(Stem::Vocals));
+        assert!(deck.snapshot().stems.muted[0]);
+        deck.load(Some(ramp_track(100)));
+        assert_eq!(deck.snapshot().stems, StemsSnapshot::default());
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod browser;
 mod cli;
 mod frontend;
 mod library_worker;
+mod recorder;
 mod settings;
 
 use std::time::Duration;
@@ -20,6 +21,7 @@ use dj_engine::{Command, DeckAction, DeckId, Engine, EngineHandle, EngineParts, 
 use dj_loader::{LoadEvent, Loader};
 
 use crate::cli::{Cli, Mode};
+use crate::settings::Settings;
 
 // Backs the audio-callback allocation check: in debug builds, allocating inside
 // `assert_no_alloc` aborts the process. In release builds the check compiles away and the
@@ -37,6 +39,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse(std::env::args().skip(1))?;
+    let files = SettingsFiles::load(&cli);
 
     match cli.mode {
         Mode::Help => {
@@ -71,7 +74,7 @@ fn main() -> anyhow::Result<()> {
             ref keys,
             size: (width, height, scale),
         } => {
-            let (mut frontend, controller) = build_frontend(&cli)?;
+            let (mut frontend, controller) = build_frontend(&cli, &files)?;
             let size = dj_ui::FrameSize {
                 width,
                 height,
@@ -88,13 +91,13 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Mode::Headless { seconds } => {
-            let mut app = start(&cli)?;
+            let mut app = start(&cli, &files.settings)?;
             run_headless(&mut app, !cli.files.is_empty(), seconds)
         }
         Mode::Window => {
             // The frontend owns the audio output (its watchdog can reopen the stream),
             // so audio stops when the UI exits.
-            let (frontend, controller) = build_frontend(&cli)?;
+            let (frontend, controller) = build_frontend(&cli, &files)?;
             let window = dj_ui::WindowConfig {
                 fullscreen: cli.fullscreen,
                 prefer_wayland: cli.wayland,
@@ -157,8 +160,45 @@ fn screenshot(
 }
 
 /// Start everything the windowed (or screenshot) app needs.
-fn build_frontend(cli: &Cli) -> anyhow::Result<(frontend::Frontend, Option<Controller>)> {
-    let app = start(cli)?;
+/// The settings this run uses, and where they came from.
+struct SettingsFiles {
+    path: std::path::PathBuf,
+    /// As saved in the file.
+    saved: Settings,
+    /// With the command line's overrides.
+    settings: Settings,
+}
+
+impl SettingsFiles {
+    fn load(cli: &Cli) -> Self {
+        let path = cli
+            .settings_file
+            .clone()
+            .unwrap_or_else(Settings::default_path);
+        let saved = Settings::load(&path);
+        let settings = saved.clone().with(&cli.overrides);
+        Self {
+            path,
+            saved,
+            settings,
+        }
+    }
+}
+
+fn build_frontend(
+    cli: &Cli,
+    files: &SettingsFiles,
+) -> anyhow::Result<(frontend::Frontend, Option<Controller>)> {
+    let mut app = start(cli, &files.settings)?;
+    let recorder = app.recording.take().and_then(|source| {
+        match recorder::Recorder::spawn(source, recordings_folder(cli)) {
+            Ok(recorder) => Some(recorder),
+            Err(err) => {
+                tracing::error!("can't start the recorder: {err}");
+                None
+            }
+        }
+    });
     let library_path = cli
         .library
         .clone()
@@ -180,9 +220,13 @@ fn build_frontend(cli: &Cli) -> anyhow::Result<(frontend::Frontend, Option<Contr
         audio: app.audio,
         play_on_load: [0, 1].map(|i| cli.play && cli.files.len() > i),
         library,
-        settings: cli.settings,
+        settings: files.settings.clone(),
+        saved_settings: files.saved.clone(),
+        settings_path: files.path.clone(),
+        channels: cli.channels,
         worker,
         controller_events: app.controller_events,
+        recorder,
     };
     Ok((frontend::Frontend::new(parts), app.controller))
 }
@@ -197,6 +241,21 @@ fn music_folders(cli: &Cli) -> Vec<std::path::PathBuf> {
         .filter(|p| p.is_dir())
         .into_iter()
         .collect()
+}
+
+/// Where recordings go: --recordings, else a Recordings folder in the first music
+/// folder (~/Music), else in the home folder.
+fn recordings_folder(cli: &Cli) -> std::path::PathBuf {
+    if let Some(folder) = &cli.recordings {
+        return folder.clone();
+    }
+    let base = match music_folders(cli).into_iter().next() {
+        Some(music) => music,
+        None => std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("Music"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    };
+    base.join(recorder::RECORDINGS_FOLDER)
 }
 
 /// Open the library, or carry on without one (hot cues then aren't saved).
@@ -220,11 +279,29 @@ struct Running {
     controller: Option<Controller>,
     /// Browsing and loading from the controller, for the frontend.
     controller_events: std::sync::mpsc::Receiver<dj_control::UiEvent>,
+    /// The main output for the recorder; taken when the recorder starts.
+    recording: Option<dj_engine::RecordSource>,
+}
+
+/// The engine setup for `device`: key lock and output mode from the settings. Per-deck
+/// output on a device without four channels falls back to the internal mix.
+fn engine_config(device: &OpenDevice, settings: &Settings) -> dj_engine::EngineConfig {
+    let mut config = device.engine_config();
+    config.key_lock = settings.key_lock;
+    match dj_engine::OutputRouting::for_mode(settings.output_mode, device.channels()) {
+        Some(routing) => config.routing = routing,
+        None => tracing::warn!(
+            "per-deck outputs need 4 channels and {} has {}; mixing internally",
+            device.device_name(),
+            device.channels()
+        ),
+    }
+    config
 }
 
 /// Open the audio device, start the engine and loader, and queue the startup files.
-fn start(cli: &Cli) -> anyhow::Result<Running> {
-    let device = OpenDevice::open(&cli.audio).context("opening audio device")?;
+fn start(cli: &Cli, settings: &Settings) -> anyhow::Result<Running> {
+    let device = OpenDevice::open(&settings.audio(cli.channels)).context("opening audio device")?;
     tracing::info!(
         "audio: {} — {} ch, {} Hz, {:?}, buffer {:?}",
         device.device_name(),
@@ -238,7 +315,8 @@ fn start(cli: &Cli) -> anyhow::Result<Running> {
         ui: handle,
         control,
         tracks,
-    } = Engine::new(device.engine_config());
+        recording,
+    } = Engine::new(engine_config(&device, settings));
     let loader = Loader::spawn(device.sample_rate(), tracks).context("starting loader thread")?;
     let audio = device.start(engine).context("starting audio stream")?;
     let (controller_tx, controller_events) = std::sync::mpsc::channel();
@@ -249,6 +327,13 @@ fn start(cli: &Cli) -> anyhow::Result<Running> {
                 .context("starting control thread")?,
         ),
     };
+    let mut handle = handle;
+    for deck in DeckId::ALL {
+        let range = DeckAction::SetTempoRange(settings.tempo_range);
+        handle
+            .send(Command::deck(deck, range))
+            .context("setting the tempo range")?;
+    }
     for (deck, file) in DeckId::ALL.into_iter().zip(&cli.files) {
         loader.load(deck, file.clone());
     }
@@ -258,6 +343,7 @@ fn start(cli: &Cli) -> anyhow::Result<Running> {
         loader,
         controller,
         controller_events,
+        recording: Some(recording),
     })
 }
 
@@ -349,6 +435,21 @@ pub(crate) fn log_load_event(event: &LoadEvent) {
         ),
         LoadEvent::Failed { deck, path, error } => {
             tracing::error!("deck {deck:?}: cannot load {}: {error}", path.display())
+        }
+        LoadEvent::StemsLoaded {
+            deck,
+            bytes,
+            offset,
+            residual_db,
+            elapsed,
+            ..
+        } => tracing::info!(
+            "deck {deck:?}: stems loaded in {elapsed:.1?}: {:.0} MB, offset {offset} frames, \
+             residual {residual_db:.1} dB",
+            *bytes as f64 / 1e6,
+        ),
+        LoadEvent::StemsFailed { deck, error, .. } => {
+            tracing::warn!("deck {deck:?}: stems not loaded: {error}")
         }
     }
 }

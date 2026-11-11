@@ -56,6 +56,26 @@ impl OutputRouting {
             cue,
         }
     }
+
+    /// Deck A on 1–2 and deck B on 3–4, for an external mixer. `None` for devices with
+    /// fewer than four channels, where deck B would have nowhere to go.
+    pub fn per_deck(channels: usize) -> Option<Self> {
+        match channels {
+            0..=3 => None,
+            _ => Some(Self {
+                mode: OutputMode::PerDeck,
+                ..Self::internal_mix(channels)
+            }),
+        }
+    }
+
+    /// Routing for `mode` on a `channels`-channel device; `None` if it can't be done.
+    pub fn for_mode(mode: OutputMode, channels: usize) -> Option<Self> {
+        match mode {
+            OutputMode::InternalMix => Some(Self::internal_mix(channels)),
+            OutputMode::PerDeck => Self::per_deck(channels),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -72,6 +92,15 @@ mod tests {
     #[test]
     fn four_channel_device_has_cue_on_3_4() {
         let r = OutputRouting::internal_mix(4);
+        assert_eq!(r.cue, Some(StereoPair::new(2, 3)));
+    }
+
+    #[test]
+    fn per_deck_needs_four_channels() {
+        assert_eq!(OutputRouting::per_deck(2), None);
+        let r = OutputRouting::for_mode(OutputMode::PerDeck, 4).unwrap();
+        assert_eq!(r.mode, OutputMode::PerDeck);
+        assert_eq!(r.main, StereoPair::new(0, 1));
         assert_eq!(r.cue, Some(StereoPair::new(2, 3)));
     }
 

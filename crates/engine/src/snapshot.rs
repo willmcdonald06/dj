@@ -1,6 +1,7 @@
 //! State published by the audio thread for the UI to read.
 
 use crate::deck::{DeckId, DeckSnapshot};
+use crate::fx::FxSnapshot;
 use crate::mixer::{ChannelSnapshot, MasterSnapshot};
 
 /// A copy of engine state, written by the audio thread once per callback into a triple
@@ -12,6 +13,7 @@ pub struct EngineSnapshot {
     /// Mixer channel of each deck.
     pub channels: [ChannelSnapshot; 2],
     pub master: MasterSnapshot,
+    pub fx: FxSnapshot,
     pub quantize: bool,
     pub tone_enabled: bool,
     pub tone_frequency_hz: f32,
@@ -20,6 +22,8 @@ pub struct EngineSnapshot {
     pub frames_processed: u64,
     /// Peak absolute sample on the main bus in the last callback.
     pub main_peak: f32,
+    /// Internal mix, or per-deck outputs with the software mixer bypassed.
+    pub output_mode: crate::OutputMode,
 }
 
 impl EngineSnapshot {
@@ -39,12 +43,14 @@ impl Default for EngineSnapshot {
             decks: [DeckSnapshot::default(); 2],
             channels: [ChannelSnapshot::default(); 2],
             master: MasterSnapshot::default(),
+            fx: FxSnapshot::default(),
             quantize: false,
             tone_enabled: false,
             tone_frequency_hz: 440.0,
             tone_gain: 0.25,
             frames_processed: 0,
             main_peak: 0.0,
+            output_mode: crate::OutputMode::InternalMix,
         }
     }
 }

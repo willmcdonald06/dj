@@ -3,10 +3,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use dj_audio_io::AudioSettings;
 use dj_control::ControlSettings;
 
-use crate::settings::{Settings, parse_key_notation, parse_waveform_style};
+use crate::settings::{Overrides, parse_key_notation, parse_waveform_style};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -39,7 +38,12 @@ pub enum Mode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
     pub mode: Mode,
-    pub audio: AudioSettings,
+    /// Settings given as options; they win over the settings file for this run.
+    pub overrides: Overrides,
+    /// Output channels to ask for (`--channels`); `None` prefers 4, then 2.
+    pub channels: Option<u16>,
+    /// Settings file; `None` uses the default location.
+    pub settings_file: Option<PathBuf>,
     pub fullscreen: bool,
     /// Tracks to load at startup: the first onto deck A, the second onto deck B.
     pub files: Vec<PathBuf>,
@@ -52,16 +56,19 @@ pub struct Cli {
     pub wayland: bool,
     /// Library database; `None` uses the default location.
     pub library: Option<PathBuf>,
-    pub settings: Settings,
     /// Music folders to scan (empty: ~/Music).
     pub music: Vec<PathBuf>,
+    /// Where recordings go; `None`: `Recordings` in the music folder.
+    pub recordings: Option<PathBuf>,
 }
 
 impl Cli {
     pub fn parse(args: impl IntoIterator<Item = String>) -> anyhow::Result<Self> {
         let mut cli = Cli {
             mode: Mode::Window,
-            audio: AudioSettings::default(),
+            overrides: Overrides::default(),
+            channels: None,
+            settings_file: None,
             fullscreen: false,
             files: Vec::new(),
             control: ControlSettings::default(),
@@ -69,8 +76,8 @@ impl Cli {
             play: false,
             wayland: false,
             library: None,
-            settings: Settings::default(),
             music: Vec::new(),
+            recordings: None,
         };
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -127,17 +134,20 @@ impl Cli {
                 "--wayland" => cli.wayland = true,
                 "--library" => cli.library = Some(PathBuf::from(value(&mut args, &arg)?)),
                 "--music" => cli.music.push(PathBuf::from(value(&mut args, &arg)?)),
+                "--recordings" => cli.recordings = Some(PathBuf::from(value(&mut args, &arg)?)),
                 "--key-notation" => {
                     let value = value(&mut args, &arg)?;
-                    cli.settings.key_notation = parse_key_notation(&value).with_context(|| {
+                    let notation = parse_key_notation(&value).with_context(|| {
                         format!("--key-notation takes open, camelot or musical, not {value:?}")
                     })?;
+                    cli.overrides.key_notation = Some(notation);
                 }
                 "--waveform" => {
                     let value = value(&mut args, &arg)?;
-                    cli.settings.waveform = parse_waveform_style(&value).with_context(|| {
+                    let style = parse_waveform_style(&value).with_context(|| {
                         format!("--waveform takes spectrum or bands, not {value:?}")
                     })?;
+                    cli.overrides.waveform = Some(style);
                 }
                 "--headless" => {
                     let seconds = value(&mut args, &arg)?;
@@ -145,21 +155,25 @@ impl Cli {
                         seconds: seconds.parse().context("--headless takes seconds")?,
                     };
                 }
-                "--device" => cli.audio.device = Some(value(&mut args, &arg)?),
+                "--settings" => cli.settings_file = Some(PathBuf::from(value(&mut args, &arg)?)),
+                "--device" => cli.overrides.audio_device = Some(value(&mut args, &arg)?),
                 "--rate" => {
-                    cli.audio.sample_rate = value(&mut args, &arg)?
+                    let rate = value(&mut args, &arg)?
                         .parse()
                         .context("--rate takes a sample rate in Hz")?;
+                    cli.overrides.sample_rate = Some(rate);
                 }
                 "--buffer" => {
                     let frames = value(&mut args, &arg)?;
-                    cli.audio.buffer_frames = match frames.as_str() {
-                        "default" => None,
-                        n => Some(n.parse().context("--buffer takes frames or 'default'")?),
+                    cli.overrides.buffer_frames = match frames.as_str() {
+                        "default" => Some(None),
+                        n => Some(Some(
+                            n.parse().context("--buffer takes frames or 'default'")?,
+                        )),
                     };
                 }
                 "--channels" => {
-                    cli.audio.channels = Some(
+                    cli.channels = Some(
                         value(&mut args, &arg)?
                             .parse()
                             .context("--channels takes a number")?,
@@ -192,6 +206,9 @@ Files given on the command line load onto deck A and deck B. In the window, drop
 file onto it to load it onto the selected deck.
 
 OPTIONS:
+  --settings FILE      Settings file. Default: ~/.config/dj/settings.toml (macOS:
+                       ~/Library/Application Support/dj/settings.toml). The options
+                       below override it for this run only
   --device NAME        Output device (substring match). Default: system default
   --rate HZ            Engine sample rate. Default: 48000
   --buffer FRAMES      Period size in frames, or 'default'. Default: 128
@@ -206,6 +223,8 @@ OPTIONS:
                        --screenshot-size WxH[@SCALE] sets the size
   --music DIR          Music folder to scan into the library (repeatable). Default:
                        ~/Music. USB drives are added when plugged in
+  --recordings DIR     Where REC saves the main output (24-bit WAV). Default:
+                       Recordings in the music folder (~/Music/Recordings)
   --library FILE       Library database (hot cues, loops). Default:
                        ~/.local/share/dj/library.db (macOS: ~/Library/Application
                        Support/dj/library.db)
@@ -268,21 +287,21 @@ mod tests {
     fn defaults() {
         let cli = parse(&[]).unwrap();
         assert_eq!(cli.mode, Mode::Window);
-        assert_eq!(cli.audio, AudioSettings::default());
+        assert_eq!(cli.overrides, Overrides::default());
     }
 
     #[test]
     fn parses_audio_options() {
         let cli = parse(&["--device", "DJ-505", "--buffer", "256", "--channels", "4"]).unwrap();
-        assert_eq!(cli.audio.device.as_deref(), Some("DJ-505"));
-        assert_eq!(cli.audio.buffer_frames, Some(256));
-        assert_eq!(cli.audio.channels, Some(4));
+        assert_eq!(cli.overrides.audio_device.as_deref(), Some("DJ-505"));
+        assert_eq!(cli.overrides.buffer_frames, Some(Some(256)));
+        assert_eq!(cli.channels, Some(4));
     }
 
     #[test]
     fn buffer_default_keyword() {
         let cli = parse(&["--buffer", "default"]).unwrap();
-        assert_eq!(cli.audio.buffer_frames, None);
+        assert_eq!(cli.overrides.buffer_frames, Some(None));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! The internal mixer: per-channel trim, 3-band EQ, filter, fader and headphone cue
-//! (PFL), plus main and headphone buses.
+//! (PFL), the beat FX unit (after the faders), plus main and headphone buses.
 //!
 //! Control values arrive normalised, the way a controller sends them (knobs 0..1 with
 //! 0.5 at the centre detent, the filter -1..1, faders 0..1). The curves that turn them
@@ -9,7 +9,9 @@
 //!
 //! **RT-safe**: fixed state, no allocation.
 
+use crate::deck::DeckId;
 use crate::dsp::{IsolatorEq, Smoothed, Svf, SvfCoefficients};
+use crate::fx::{FxClock, FxControl, FxSnapshot, FxTarget, FxUnit};
 
 /// Boost at the top of the EQ knobs.
 pub const EQ_MAX_DB: f32 = 6.0;
@@ -299,6 +301,7 @@ pub struct MixFrame {
 
 pub struct Mixer {
     channels: [Channel; 2],
+    fx: FxUnit,
     master: MasterSnapshot,
     main_level: Smoothed,
     phones_level: Smoothed,
@@ -311,6 +314,7 @@ impl Mixer {
         let master = MasterSnapshot::default();
         Self {
             channels: [Channel::new(sr), Channel::new(sr)],
+            fx: FxUnit::new(sample_rate),
             master,
             main_level: Smoothed::new(sr, fader_gain(master.main_level)),
             phones_level: Smoothed::new(sr, fader_gain(master.phones_level)),
@@ -342,6 +346,19 @@ impl Mixer {
         }
     }
 
+    pub fn apply_fx(&mut self, control: FxControl) {
+        self.fx.apply(control);
+    }
+
+    /// The tempo and beat for the FX, once per block (see [`FxUnit::set_clock`]).
+    pub fn set_fx_clock(&mut self, clock: Option<FxClock>) {
+        self.fx.set_clock(clock);
+    }
+
+    pub fn fx_snapshot(&self) -> FxSnapshot {
+        self.fx.snapshot()
+    }
+
     /// Reset meters; call once per callback before processing.
     pub fn begin_block(&mut self) {
         for channel in &mut self.channels {
@@ -355,12 +372,19 @@ impl Mixer {
     pub fn process(&mut self, decks: [(f32, f32); 2]) -> MixFrame {
         let mut main = (0.0, 0.0);
         let mut cue = (0.0, 0.0);
-        for (channel, input) in self.channels.iter_mut().zip(decks) {
-            let (_pre, post, send) = channel.process(input);
+        let fx_target = self.fx.target();
+        for (i, (channel, input)) in self.channels.iter_mut().zip(decks).enumerate() {
+            let (_pre, mut post, send) = channel.process(input);
+            if fx_target == FxTarget::Deck(DeckId::ALL[i]) {
+                post = self.fx.process(post);
+            }
             main.0 += post.0;
             main.1 += post.1;
             cue.0 += send.0;
             cue.1 += send.1;
+        }
+        if fx_target == FxTarget::Main {
+            main = self.fx.process(main);
         }
         let main_level = self.main_level.tick();
         let main = (main.0 * main_level, main.1 * main_level);

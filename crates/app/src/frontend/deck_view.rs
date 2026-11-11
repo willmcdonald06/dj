@@ -2,7 +2,9 @@
 //! and the tempo fader.
 
 use dj_analysis::{Key as MusicalKey, KeyNotation, TrackAnalysis};
-use dj_engine::{DeckAction, DeckId, DeckSnapshot, HotCue, TempoRange, Transport};
+use dj_engine::{
+    DeckAction, DeckId, DeckSnapshot, HotCue, STEM_COUNT, Stem, TempoRange, Transport,
+};
 use dj_loader::TrackInfo;
 use dj_ui::{Align, Rect, WaveformStyle};
 
@@ -11,8 +13,8 @@ use super::painter::{Icon, Painter, ink_on};
 use super::theme::*;
 use super::waves::deck_letter;
 use super::{
-    Control, JUMP_PADS, KEY_NUDGE, PadMode, PadState, ROLL_PADS, Slider, TEMPO_FINE, UiAction,
-    clock,
+    Control, GridEdit, JUMP_PADS, KEY_NUDGE, PadMode, PadState, ROLL_PADS, Slider, TEMPO_FINE,
+    UiAction, clock, stem_pad,
 };
 
 /// A deck's key as shown in its header.
@@ -335,8 +337,10 @@ impl Painter {
             ("HOT CUE", PadMode::HotCue),
             ("ROLL", PadMode::Roll),
             ("JUMP", PadMode::Jump),
+            ("GRID", PadMode::Grid),
+            ("STEMS", PadMode::Stems),
         ];
-        let tab_w = self.px(64.0);
+        let tab_w = self.px(52.0);
         let mut x = area.x;
         for (label, mode) in modes {
             let tab = Area::new(x, area.y, tab_w, area.height);
@@ -356,8 +360,10 @@ impl Painter {
             self.hit(tab, Control::Button(UiAction::PadMode(v.deck, mode)));
             x += tab_w;
         }
+        let mut right = area;
         if v.pads.mode == PadMode::HotCue {
-            let (delete, _) = area.split_right(self.px(64.0), 0.0);
+            let (delete, rest) = area.split_right(self.px(64.0), self.px(8.0));
+            right = rest;
             let label = match v.pads.delete_armed {
                 true => "TAP A CUE",
                 false => "DELETE",
@@ -369,6 +375,37 @@ impl Painter {
                 DANGER,
                 UiAction::DeleteArm(v.deck),
             );
+        }
+        self.stem_chips(v, right, x);
+    }
+
+    /// One small chip per stem at the right of `area` (left of `min_x` is taken):
+    /// lit while the stem plays, dark while muted; click to toggle. Hidden when the
+    /// track has no stems.
+    fn stem_chips(&mut self, v: &DeckView<'_>, area: Area, min_x: f32) {
+        let stems = v.d.stems;
+        if !stems.available {
+            return;
+        }
+        let chip = self.px(16.0);
+        let gap = self.px(3.0);
+        let width = chip * STEM_COUNT as f32 + gap * (STEM_COUNT - 1) as f32;
+        if area.right() - width < min_x {
+            return;
+        }
+        let mut x = area.right() - width;
+        for stem in Stem::ALL {
+            let cell = Area::new(x, area.y + self.px(1.0), chip, area.height - self.px(2.0));
+            let playing = !stems.muted[stem.index()];
+            let letter = &stem.label()[..1];
+            self.tinted_button(
+                cell,
+                letter,
+                playing,
+                STEM_COLORS[stem.index()],
+                UiAction::Deck(v.deck, DeckAction::ToggleStem(stem)),
+            );
+            x += chip + gap;
         }
     }
 
@@ -411,6 +448,54 @@ impl Painter {
                         UiAction::Deck(deck, DeckAction::BeatJump { beats }),
                     );
                 }
+                PadMode::Grid => {
+                    let (label, edit) = GRID_PADS[i];
+                    let color = match edit {
+                        GridEdit::Reset => DANGER,
+                        _ => TEXT,
+                    };
+                    self.tinted_button(pad, label, false, color, UiAction::Grid(deck, edit));
+                }
+                PadMode::Stems => {
+                    let stems = d.stems;
+                    let stem = Stem::ALL[i % STEM_COUNT];
+                    let color = STEM_COLORS[stem.index()];
+                    let playing = !stems.muted[stem.index()];
+                    let label = STEM_PAD_LABELS[stem.index()];
+                    let solo = i >= STEM_COUNT;
+                    let lit = match solo {
+                        false => playing,
+                        true => Stem::ALL
+                            .iter()
+                            .all(|&s| stems.muted[s.index()] == (s != stem)),
+                    };
+                    // Without stems the pads stay live (mutes apply once they load)
+                    // but greyed.
+                    let color = match stems.available {
+                        true => color,
+                        false => DIM_TEXT,
+                    };
+                    self.tinted_button(
+                        pad,
+                        label,
+                        lit && stems.available,
+                        color,
+                        stem_pad(deck, i),
+                    );
+                    if solo {
+                        let caption = Area::new(
+                            pad.x,
+                            pad.bottom() - self.px(14.0),
+                            pad.width,
+                            self.px(12.0),
+                        );
+                        let ink = match lit && stems.available {
+                            true => ink_on(color),
+                            false => SOFT_TEXT,
+                        };
+                        self.label(caption, "SOLO", 7.5, ink, Align::Center);
+                    }
+                }
             }
         }
     }
@@ -443,6 +528,21 @@ impl Painter {
         );
     }
 }
+
+/// Stem names short enough for a pad.
+const STEM_PAD_LABELS: [&str; STEM_COUNT] = ["VOX", "MEL", "BASS", "DRUM"];
+
+/// Grid pads: label and edit.
+const GRID_PADS: [(&str, GridEdit); 8] = [
+    ("1 HERE", GridEdit::DownbeatHere),
+    ("BEAT ›", GridEdit::NextBeat),
+    ("½ BEAT", GridEdit::HalfBeat),
+    ("‹ 2 ms", GridEdit::Nudge(-2.0)),
+    ("2 ms ›", GridEdit::Nudge(2.0)),
+    ("BPM ×2", GridEdit::Scale(2.0)),
+    ("BPM ÷2", GridEdit::Scale(0.5)),
+    ("RESET", GridEdit::Reset),
+];
 
 /// `1/4`, `1`, `16`…
 pub fn beats_label(beats: f32) -> String {

@@ -31,6 +31,8 @@ pub enum Icon {
     /// Pointing left or right, for steps and nudges.
     Left,
     Right,
+    /// Three sliders: the settings.
+    Settings,
 }
 
 impl Painter {
@@ -252,6 +254,20 @@ impl Painter {
             Icon::Play => self.push(triangle(0, size)),
             Icon::Right => self.push(triangle(0, size * 0.7)),
             Icon::Left => self.push(triangle(2, size * 0.7)),
+            Icon::Settings => {
+                let w = size * 1.15;
+                let line = self.px(1.5).max(1.0);
+                let knob = size * 0.32;
+                for (row, offset) in [(-1.0, -0.22), (0.0, 0.22), (1.0, -0.05)] {
+                    let y = cy + row * size * 0.38;
+                    self.push(Rect::new(cx - w / 2.0, y - line / 2.0, w, line, color));
+                    let x = cx + offset * w;
+                    self.push(
+                        Rect::new(x - knob / 2.0, y - knob / 2.0, knob, knob, color)
+                            .rounded(knob / 2.0),
+                    );
+                }
+            }
             Icon::Pause => {
                 let bar = size * 0.3;
                 for x in [cx - size * 0.35, cx + size * 0.05] {
@@ -278,6 +294,31 @@ impl Painter {
         let label_h = self.px(12.0);
         let d = (area.height - label_h).min(area.width).max(4.0);
         let dial = Area::new(area.centre_x() - d / 2.0, area.y, d, d);
+        self.dial(dial, value, centred, color);
+        let label_area = Area::new(area.x, dial.bottom(), area.width, label_h);
+        self.bold(label_area, label, 8.5, SOFT_TEXT, Align::Center);
+        self.hit(
+            Area::new(area.x, area.y, area.width, d),
+            Control::Slider(slider, Drag::Knob),
+        );
+    }
+
+    /// A knob filling the height of `area`, with no label.
+    pub fn small_knob(&mut self, area: Area, value: f32, color: Color, slider: Slider) {
+        let d = area.height.min(area.width).max(4.0);
+        let dial = Area::new(
+            area.centre_x() - d / 2.0,
+            area.y + (area.height - d) / 2.0,
+            d,
+            d,
+        );
+        self.dial(dial, value, false, color);
+        self.hit(area, Control::Slider(slider, Drag::Knob));
+    }
+
+    /// The ring and cap of a knob in the square `dial`.
+    fn dial(&mut self, dial: Area, value: f32, centred: bool, color: Color) {
+        let d = dial.width;
         let start = -KNOB_SWEEP / 2.0;
         let angle = start + value.clamp(0.0, 1.0) * KNOB_SWEEP;
         let track = self.px(3.0);
@@ -333,12 +374,6 @@ impl Painter {
                 start: 0.0,
                 end: 2.0 * PI,
             }),
-        );
-        let label_area = Area::new(area.x, dial.bottom(), area.width, label_h);
-        self.bold(label_area, label, 8.5, SOFT_TEXT, Align::Center);
-        self.hit(
-            Area::new(area.x, area.y, area.width, d),
-            Control::Slider(slider, Drag::Knob),
         );
     }
 

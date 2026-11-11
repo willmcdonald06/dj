@@ -58,15 +58,24 @@ impl HotCue {
 /// Loop wraps the time-stretcher's input has made that the heard playhead hasn't caught
 /// up with yet: the stretcher reads ahead of what you hear by its latency, so the
 /// playhead must wrap later, at the same point, even if the loop was exited meanwhile.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct PendingWraps {
-    wraps: [(f64, f64); 4],
+    wraps: [(f64, f64); 64],
     count: usize,
 }
 
+impl Default for PendingWraps {
+    fn default() -> Self {
+        Self {
+            wraps: [(0.0, 0.0); 64],
+            count: 0,
+        }
+    }
+}
+
 impl PendingWraps {
-    /// Record a wrap at `end` back by `len` frames. Drops it if full (it can't be:
-    /// loops are far longer than the stretcher's latency).
+    /// Record a wrap at `end` back by `len` frames. Drops it if full (it can't be: the
+    /// shortest loop wraps fewer than 64 times within the stretcher's latency).
     pub fn push(&mut self, end: f64, len: f64) {
         if self.count < self.wraps.len() {
             self.wraps[self.count] = (end, len);

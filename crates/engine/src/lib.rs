@@ -19,11 +19,15 @@ mod command;
 mod cues;
 mod deck;
 pub mod dsp;
+mod fx;
 mod grid;
 mod mixer;
 mod osc;
+mod record;
 mod routing;
 mod snapshot;
+pub mod stem_codec;
+mod stems;
 mod sync;
 mod track;
 
@@ -34,13 +38,16 @@ pub use deck::{
     TempoRange, Transport,
 };
 pub use dj_stretch::Quality as StretchQuality;
+pub use fx::{DEFAULT_FX_BPM, FX_BEATS, FxClock, FxControl, FxKind, FxSnapshot, FxTarget};
 pub use grid::{BeatGrid, wrap_half};
 pub use mixer::{
     ChannelControl, ChannelSnapshot, EQ_MAX_DB, FILTER_DEAD_ZONE, MasterControl, MasterSnapshot,
     TRIM_MAX_DB, db_to_gain, fader_gain, knob_gain,
 };
+pub use record::{RECORD_CHANNELS, RECORD_QUEUE_SECONDS, RecordSource};
 pub use routing::{OutputMode, OutputRouting, StereoPair};
 pub use snapshot::EngineSnapshot;
+pub use stems::{STEM_COUNT, STEM_RAMP_SECONDS, Stem, StemCache, StemSet, StemsSnapshot};
 pub use track::{TRACK_CHANNELS, Track, TrackId, TrackWriter};
 
 use std::sync::Arc;
@@ -49,6 +56,7 @@ use deck::Deck;
 use dj_stretch::Signalsmith;
 use mixer::Mixer;
 use osc::SineOsc;
+use record::RecordTap;
 
 /// Capacity of the command queue into the audio thread. Also bounds how many commands
 /// a single callback will process.
@@ -95,11 +103,11 @@ impl std::fmt::Display for QueueFull {
 
 impl std::error::Error for QueueFull {}
 
-/// A track ready to go onto a deck.
+/// A track, or a track's stems, ready to go onto a deck.
 #[derive(Debug)]
-pub struct TrackLoad {
-    pub deck: DeckId,
-    pub track: Arc<Track>,
+pub enum TrackLoad {
+    Track { deck: DeckId, track: Arc<Track> },
+    Stems { deck: DeckId, stems: Arc<StemSet> },
 }
 
 /// Loader-side sender of decoded tracks to the audio thread. Not RT-safe to create;
@@ -113,7 +121,17 @@ impl TrackSender {
     /// to the track so the audio thread never frees it. On a full queue the load is
     /// handed back.
     pub fn send(&mut self, deck: DeckId, track: Arc<Track>) -> Result<(), TrackLoad> {
-        match self.loads.push(TrackLoad { deck, track }) {
+        self.push(TrackLoad::Track { deck, track })
+    }
+
+    /// Queue stems for the track on `deck`; the deck ignores them if another track has
+    /// been loaded since. As with tracks, the caller keeps a reference.
+    pub fn send_stems(&mut self, deck: DeckId, stems: Arc<StemSet>) -> Result<(), TrackLoad> {
+        self.push(TrackLoad::Stems { deck, stems })
+    }
+
+    fn push(&mut self, load: TrackLoad) -> Result<(), TrackLoad> {
+        match self.loads.push(load) {
             Ok(()) => Ok(()),
             Err(rtrb::PushError::Full(load)) => Err(load),
         }
@@ -158,6 +176,10 @@ pub struct Engine {
     sync: sync::Sync,
     state: EngineSnapshot,
     tone: SineOsc,
+    /// Copy of the main bus for the recorder, and its block buffer
+    /// ([`RENDER_BLOCK`] stereo frames).
+    record: RecordTap,
+    record_block: Vec<f32>,
 }
 
 /// Everything [`Engine::new`] creates.
@@ -170,6 +192,8 @@ pub struct EngineParts {
     pub control: EngineHandle,
     /// For the loader thread.
     pub tracks: TrackSender,
+    /// For the recorder: the main output while recording is armed.
+    pub recording: RecordSource,
 }
 
 impl Engine {
@@ -181,6 +205,7 @@ impl Engine {
     pub fn new(config: EngineConfig) -> EngineParts {
         let initial = EngineSnapshot {
             sample_rate: config.sample_rate,
+            output_mode: config.routing.mode,
             ..EngineSnapshot::default()
         };
         let link = || {
@@ -195,6 +220,7 @@ impl Engine {
         let (ui, ui_commands, ui_snapshots) = link();
         let (control, control_commands, control_snapshots) = link();
         let (load_producer, load_consumer) = rtrb::RingBuffer::new(TRACK_QUEUE_CAPACITY);
+        let (record, recording) = record::record_link(config.sample_rate);
 
         let mut tone = SineOsc::new(config.sample_rate as f32);
         tone.set_frequency(initial.tone_frequency_hz);
@@ -214,6 +240,8 @@ impl Engine {
             sync: sync::Sync::default(),
             state: initial,
             tone,
+            record,
+            record_block: vec![0.0; RENDER_BLOCK * record::RECORD_CHANNELS],
         };
         EngineParts {
             engine,
@@ -222,11 +250,22 @@ impl Engine {
             tracks: TrackSender {
                 loads: load_producer,
             },
+            recording,
         }
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// Change where the buses go, e.g. for a device with a different channel count or
+    /// to switch to per-deck outputs. Only while the engine is off the audio thread (it
+    /// takes `&mut self`, so it can't be called while a callback owns it). Not RT-safe
+    /// to call from the callback; it doesn't allocate, but the caller is the one moving
+    /// the engine between streams.
+    pub fn set_routing(&mut self, routing: OutputRouting) {
+        self.config.routing = routing;
+        self.state.output_mode = routing.mode;
     }
 
     /// Render `frames` frames into the interleaved buffer `out`, which must hold at
@@ -239,6 +278,8 @@ impl Engine {
         self.drain_loads();
         self.drain_commands();
         self.sync.update(&mut self.decks, self.config.sample_rate);
+        let clock = self.fx_clock();
+        self.mixer.set_fx_clock(clock);
 
         let routing = self.config.routing;
         let channels = routing.channels;
@@ -257,6 +298,7 @@ impl Engine {
         self.mixer.begin_block();
         let mut peak = 0.0f32;
         let mut deck_peaks = [0.0f32; 2];
+        let recording = self.record.armed();
 
         for block in out.chunks_mut(RENDER_BLOCK * channels) {
             let n = block.len() / channels;
@@ -286,10 +328,17 @@ impl Engine {
                 peak = peak.max(main.0.abs()).max(main.1.abs());
                 frame[routing.main.left] = main.0;
                 frame[routing.main.right] = main.1;
+                if recording {
+                    self.record_block[i * 2] = main.0;
+                    self.record_block[i * 2 + 1] = main.1;
+                }
                 if let Some(pair) = routing.cue {
                     frame[pair.left] = (second.0 + tone).clamp(-1.0, 1.0);
                     frame[pair.right] = (second.1 + tone).clamp(-1.0, 1.0);
                 }
+            }
+            if recording {
+                self.record.write(&self.record_block[..n * 2]);
             }
         }
 
@@ -302,6 +351,7 @@ impl Engine {
             self.state.channels[i] = self.mixer.channel_snapshot(i);
         }
         self.state.master = self.mixer.master_snapshot();
+        self.state.fx = self.mixer.fx_snapshot();
         for snapshots in &mut self.snapshots {
             snapshots.write(self.state);
         }
@@ -316,7 +366,10 @@ impl Engine {
                 Ok(load) => load,
                 Err(_) => break,
             };
-            self.decks[load.deck.index()].load(Some(load.track));
+            match load {
+                TrackLoad::Track { deck, track } => self.decks[deck.index()].load(Some(track)),
+                TrackLoad::Stems { deck, stems } => self.decks[deck.index()].set_stems(stems),
+            }
         }
     }
 
@@ -332,6 +385,38 @@ impl Engine {
                 self.apply(command);
             }
         }
+    }
+
+    /// The tempo and beat the FX follows: its target deck's, or for the main mix the
+    /// sync master's, else the playing deck with the higher fader.
+    fn fx_clock(&self) -> Option<FxClock> {
+        let deck = match self.mixer.fx_snapshot().target {
+            FxTarget::Deck(deck) => deck.index(),
+            FxTarget::Main => {
+                let master = self
+                    .sync
+                    .master()
+                    .filter(|&i| self.decks[i].sync_lock() && self.decks[i].grid().is_some());
+                let playing =
+                    |i: usize| self.decks[i].is_moving() && self.decks[i].grid().is_some();
+                let fader = |i: usize| self.mixer.channel_snapshot(i).fader;
+                match (master, playing(0), playing(1)) {
+                    (Some(i), _, _) => i,
+                    (None, true, true) if fader(1) > fader(0) => 1,
+                    (None, true, _) => 0,
+                    (None, false, true) => 1,
+                    (None, false, false) => return None,
+                }
+            }
+        };
+        let deck = &self.decks[deck];
+        let grid = deck.grid()?;
+        let bpm = (grid.bpm(self.config.sample_rate) * deck.tempo_rate() as f64) as f32;
+        let beat = match deck.is_moving() {
+            true => Some((deck.target_position() - grid.anchor) / grid.period),
+            false => None,
+        };
+        Some(FxClock { bpm, beat })
     }
 
     fn set_quantize(&mut self, on: bool) {
@@ -375,6 +460,7 @@ impl Engine {
             Command::ToggleQuantize => self.set_quantize(!self.state.quantize),
             Command::Channel { deck, control } => self.mixer.apply_channel(deck.index(), control),
             Command::Master(control) => self.mixer.apply_master(control),
+            Command::Fx(control) => self.mixer.apply_fx(control),
             Command::SetToneEnabled(enabled) => {
                 self.state.tone_enabled = enabled;
                 self.tone.set_enabled(enabled);
@@ -500,6 +586,35 @@ mod tests {
         assert!(max_step < 0.05, "step {max_step}");
         assert!(buf[buf.len() - 200..].iter().all(|&s| s == 0.0));
         assert!(!handle.snapshot().tone_enabled);
+    }
+
+    #[test]
+    fn recording_copies_the_main_bus_only_while_armed() {
+        let EngineParts {
+            mut engine,
+            ui: mut handle,
+            mut recording,
+            ..
+        } = Engine::new(EngineConfig::new(SR, 4));
+        handle.send(Command::SetToneEnabled(true)).unwrap();
+        render(&mut engine, 1000);
+        let mut recorded = Vec::new();
+        assert_eq!(recording.drain_into(&mut recorded), 0, "not armed yet");
+
+        recording.set_armed(true);
+        // Longer than one render block, to cover the block boundaries.
+        let buf = render(&mut engine, RENDER_BLOCK * 3 + 7);
+        recording.set_armed(false);
+        render(&mut engine, 1000);
+
+        recording.drain_into(&mut recorded);
+        let main: Vec<f32> = buf
+            .chunks_exact(4)
+            .flat_map(|frame| [frame[0], frame[1]])
+            .collect();
+        assert_eq!(recorded, main);
+        assert!(recorded.iter().any(|&s| s != 0.0));
+        assert_eq!(recording.dropped_frames(), 0);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Commands sent from the control and UI threads into the audio thread.
 
 use crate::deck::{DeckAction, DeckId};
+use crate::fx::FxControl;
 use crate::mixer::{ChannelControl, MasterControl};
 
 /// A request to change engine state. Must stay `Copy` and small: commands travel
@@ -19,6 +20,8 @@ pub enum Command {
     },
     /// A main or headphone bus control.
     Master(MasterControl),
+    /// The beat FX unit.
+    Fx(FxControl),
     /// Quantize (snap cues and jumps to the beatgrid) on or off, for both decks.
     SetQuantize(bool),
     ToggleQuantize,

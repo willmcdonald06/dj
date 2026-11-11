@@ -7,11 +7,16 @@ For each audio file, writes a JSON sidecar next to it (`<file>.dj.json`) with:
 - a constant-tempo fit: BPM and the time of the first downbeat;
 - the musical key, from a constant-Q chromagram matched against key profiles.
 
+and a stems file (`<file>.stems.flac`): vocals, melody, bass and drums from the
+Demucs separator, as four stereo pairs in one 8-channel 16-bit FLAC.
+
 The app imports sidecars when it scans the library and prefers them over its own
-quick in-app analysis. Run it on a desktop (it is too heavy for the CM5):
+quick in-app analysis, and loads stems with the track. Run it on a desktop (it is too
+heavy for the CM5):
 
     tools/analyze/analyze.py ~/Music            # everything not analysed yet
     tools/analyze/analyze.py --force track.mp3  # redo one file
+    tools/analyze/analyze.py --no-stems ~/Music # beats and key only (much faster)
 
 Setup (once): see tools/analyze/README.md.
 """
@@ -26,14 +31,31 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
+# Run under the tool's own virtualenv (tools/analyze/.venv) when it exists, so plain
+# `tools/analyze/analyze.py` or `python3 analyze.py` finds beat_this and demucs.
+_VENV = Path(__file__).resolve().parent / ".venv"
+if (_VENV / "bin" / "python").exists() and Path(sys.prefix).resolve() != _VENV.resolve():
+    _python = str(_VENV / "bin" / "python")
+    os.execv(_python, [_python, str(Path(__file__).resolve()), *sys.argv[1:]])
+
+import numpy as np  # noqa: E402
 
 FORMAT = "dj-analysis"
 # Bump when the output changes meaning, so the app can tell old sidecars apart.
 VERSION = 1
 SIDECAR_SUFFIX = ".dj.json"
+STEMS_SUFFIX = ".stems.flac"
+STEMS_FORMAT = "dj-stems"
+# Bump when the stems change meaning (order, model), so old files get redone.
+STEMS_VERSION = 1
+# Order of the stereo pairs in a stems file, and the Demucs source for each.
+STEMS = (("vocals", "vocals"), ("melody", "other"), ("bass", "bass"), ("drums", "drums"))
+STEMS_MODEL = "htdemucs"
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".aiff", ".aif", ".m4a", ".mp4", ".ogg", ".opus"}
 SAMPLE_RATE = 22_050
+# A whole-number BPM is used if it drifts from the fit by at most this (seconds) over
+# the track; the same rule as the app.
+ROUND_BPM_MAX_DRIFT = 0.008
 
 # Temperley's (Kostka-Payne corpus) key profiles, tonic first: the same ones the app uses.
 MAJOR = np.array([0.748, 0.060, 0.488, 0.082, 0.670, 0.460, 0.096, 0.715, 0.104, 0.366, 0.057, 0.400])
@@ -43,6 +65,28 @@ NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
 def sidecar_path(audio: Path) -> Path:
     return audio.with_name(audio.name + SIDECAR_SUFFIX)
+
+
+def stems_path(audio: Path) -> Path:
+    return audio.with_name(audio.name + STEMS_SUFFIX)
+
+
+def is_generated(name: str) -> bool:
+    return name.endswith(STEMS_SUFFIX) or name.endswith(SIDECAR_SUFFIX)
+
+
+def stems_up_to_date(audio: Path) -> bool:
+    stems = stems_path(audio)
+    if not stems.exists() or stems.stat().st_mtime < audio.stat().st_mtime:
+        return False
+    try:
+        import soundfile
+
+        with soundfile.SoundFile(str(stems)) as existing:
+            tag = existing.comment or ""
+    except Exception:  # unreadable: redo it
+        return False
+    return tag.startswith(f"{STEMS_FORMAT}/{STEMS_VERSION} ")
 
 
 def up_to_date(audio: Path) -> bool:
@@ -62,9 +106,10 @@ def find_audio(paths: list[Path]) -> list[Path]:
         if path.is_dir():
             for root, _dirs, files in os.walk(path):
                 for name in sorted(files):
-                    if Path(name).suffix.lower() in AUDIO_EXTENSIONS and not name.startswith("._"):
+                    if (Path(name).suffix.lower() in AUDIO_EXTENSIONS and not name.startswith("._")
+                            and not is_generated(name)):
                         found.append(Path(root) / name)
-        elif path.suffix.lower() in AUDIO_EXTENSIONS:
+        elif path.suffix.lower() in AUDIO_EXTENSIONS and not is_generated(path.name):
             found.append(path)
     return found
 
@@ -83,7 +128,9 @@ def fit_tempo(beats: np.ndarray, downbeats: np.ndarray) -> tuple[float | None, f
 
     Searches tempos near the median beat interval for the one at which the most beats
     line up (robust to breakdowns and dropped beats, unlike fitting beat numbers), and
-    uses a whole-number BPM if it fits almost as well, as most dance music has one.
+    uses a whole-number BPM if it stays within a few milliseconds of that fit over the
+    whole track, as most dance music has one. (A looser test, "fits almost as well",
+    let grids drift by a quarter beat over a long track.)
     """
     if len(beats) < 8:
         return None, None
@@ -93,9 +140,8 @@ def fit_tempo(beats: np.ndarray, downbeats: np.ndarray) -> tuple[float | None, f
     periods = np.arange(rough * 0.97, rough * 1.03, step)
     scores = [coherence(beats, p)[0] for p in periods]
     period = float(periods[int(np.argmax(scores))])
-    best = max(scores)
     whole = 60.0 / round(60.0 / period)
-    if coherence(beats, whole)[0] >= best * 0.97:
+    if abs(whole - period) * span / period <= ROUND_BPM_MAX_DRIFT:
         period = whole
     bpm = 60.0 / period
     if abs(bpm - round(bpm)) < 1e-9:
@@ -150,6 +196,46 @@ def analyze(audio: Path, model) -> dict:
     }
 
 
+def separate(audio: Path, model, device: str) -> str:
+    """Write `<audio>.stems.flac`. Returns a short summary for the log.
+
+    The stems are written as 16-bit FLAC. Separated stems can peak above full scale
+    (even when the mix doesn't), so if they would clip they are all turned down by the
+    same factor, and the comment tag carries the gain that restores them:
+    `dj-stems/1 gain=1.2345 stems=vocals,melody,bass,drums model=htdemucs`.
+    """
+    import librosa
+    import soundfile
+    import torch
+    from demucs.apply import apply_model
+
+    signal, _ = librosa.load(str(audio), sr=model.samplerate, mono=False)
+    if signal.ndim == 1:
+        signal = np.stack([signal, signal])
+    signal = signal[:2]
+    with torch.no_grad():
+        mix = torch.from_numpy(np.ascontiguousarray(signal, dtype=np.float32))
+        sources = apply_model(model, mix[None], device=device, shifts=1, split=True, overlap=0.25,
+                              progress=False)[0].cpu().numpy()
+    order = [model.sources.index(source) for _, source in STEMS]
+    # (frames, 8): vocals L, vocals R, melody L, ...
+    stems = np.concatenate([sources[i] for i in order], axis=0).T
+    peak = float(np.max(np.abs(stems))) if stems.size else 0.0
+    headroom = 0.999
+    gain = max(peak / headroom, 1.0)
+    stems = stems / gain
+    names = ",".join(name for name, _ in STEMS)
+    comment = f"{STEMS_FORMAT}/{STEMS_VERSION} gain={gain:.6f} stems={names} model={STEMS_MODEL}"
+    target = stems_path(audio)
+    temporary = target.with_name(target.name + ".tmp")
+    with soundfile.SoundFile(str(temporary), "w", samplerate=model.samplerate, channels=stems.shape[1],
+                             subtype="PCM_16", format="FLAC") as out:
+        out.comment = comment
+        out.write(stems)
+    os.replace(temporary, target)
+    return f"stems {target.stat().st_size / 1e6:.0f} MB"
+
+
 def write_sidecar(audio: Path, data: dict) -> None:
     sidecar = sidecar_path(audio)
     temporary = sidecar.with_name(sidecar.name + ".tmp")
@@ -157,35 +243,78 @@ def write_sidecar(audio: Path, data: dict) -> None:
     os.replace(temporary, sidecar)
 
 
+def stem_model_cached() -> bool:
+    """Whether the Hugging Face cache already holds the Demucs model (its bag yaml and
+    weights). Demucs loads it with `hf_hub_download`, which otherwise asks huggingface.co
+    for the latest revision on every run even when the files are cached."""
+    hub = os.environ.get("HF_HUB_CACHE") or Path(
+        os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "hub"
+    snapshots = Path(hub) / "models--adefossez--HTDemucs" / "snapshots"
+    return any((snapshot / f"{STEMS_MODEL}.yaml").exists() and any(snapshot.glob("*.safetensors"))
+               for snapshot in snapshots.glob("*"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="+", type=Path, help="audio files or folders")
     parser.add_argument("--force", action="store_true", help="analyse even if an up-to-date sidecar exists")
     parser.add_argument("--device", default=None, help="torch device (default: cuda if available, else cpu)")
+    parser.add_argument("--no-stems", action="store_true", help="skip stem separation")
+    parser.add_argument("--stems-only", action="store_true", help="only separate stems (no beats or key)")
     args = parser.parse_args()
 
     files = find_audio(args.paths)
-    todo = [f for f in files if args.force or not up_to_date(f)]
+    want_beats = not args.stems_only
+    want_stems = not args.no_stems
+    todo = []
+    for f in files:
+        beats = want_beats and (args.force or not up_to_date(f))
+        stems = want_stems and (args.force or not stems_up_to_date(f))
+        if beats or stems:
+            todo.append((f, beats, stems))
     print(f"{len(files)} audio files, {len(todo)} to analyse", flush=True)
     if not todo:
         return 0
 
+    # Everything runs locally; the network is only needed to fetch the models once. Set
+    # before huggingface_hub is imported, since it reads these at import time.
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    if stem_model_cached():
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    elif any(stems for _, _, stems in todo):
+        print(f"downloading the Demucs model ({STEMS_MODEL}, ~80 MB) once", flush=True)
+
     import torch
-    from beat_this.inference import Audio2Beats
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = Audio2Beats(checkpoint_path="final0", device=device, dbn=False)
+    beat_model = None
+    stem_model = None
+    if any(beats for _, beats, _ in todo):
+        from beat_this.inference import Audio2Beats
+
+        beat_model = Audio2Beats(checkpoint_path="final0", device=device, dbn=False)
+    if any(stems for _, _, stems in todo):
+        from demucs.pretrained import get_model
+
+        stem_model = get_model(STEMS_MODEL)
+        stem_model.to(device)
+        stem_model.eval()
 
     failures = 0
-    for i, audio in enumerate(todo, 1):
+    for i, (audio, beats, stems) in enumerate(todo, 1):
         started = time.monotonic()
+        parts = []
         try:
-            data = analyze(audio, model)
-            write_sidecar(audio, data)
-            key = data["key"]
-            key_text = f"{key['tonic']} {key['mode']}" if key else "no key"
-            bpm = f"{data['bpm']:.2f} BPM" if data["bpm"] else "no tempo"
-            print(f"[{i}/{len(todo)}] {audio.name}: {bpm}, {key_text} ({time.monotonic() - started:.1f} s)", flush=True)
+            if beats:
+                data = analyze(audio, beat_model)
+                write_sidecar(audio, data)
+                key = data["key"]
+                parts.append(f"{data['bpm']:.2f} BPM" if data["bpm"] else "no tempo")
+                parts.append(f"{key['tonic']} {key['mode']}" if key else "no key")
+            if stems:
+                parts.append(separate(audio, stem_model, device))
+            print(f"[{i}/{len(todo)}] {audio.name}: {', '.join(parts)} ({time.monotonic() - started:.1f} s)",
+                  flush=True)
         except Exception as error:  # keep going: one bad file shouldn't stop a library run
             failures += 1
             print(f"[{i}/{len(todo)}] {audio.name}: FAILED: {error}", file=sys.stderr, flush=True)

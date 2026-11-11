@@ -1,20 +1,22 @@
-//! Constant-tempo beatgrid from kick markers: the in-app fallback until offline beat
-//! tracking (Milestone 6) provides better grids.
+//! Constant-tempo beatgrid from point events: kick markers, or the beats of a beat
+//! tracker ([`fit_beats`], for the offline analyzer's results and for evaluation).
+//! The track analysis itself uses [`crate::tempo`], which works from every onset.
 //!
 //! 1. A rough beat period from the most common kick spacing.
 //! 2. A fine search around it for the period at which the kicks line up best: each
 //!    kick is a unit vector at angle `2π · frame / period`, and kicks on a steady grid
 //!    point the same way, so the length of their sum measures how well a period fits.
 //! 3. The grid's anchor (phase) is the direction of that sum.
-//! 4. If a whole-number BPM fits almost as well, it is used: most electronic music is
-//!    produced at one.
+//! 4. If a whole-number BPM is within a few milliseconds over the whole track, it is
+//!    used: most electronic music is produced at one.
 
 use dj_engine::BeatGrid;
 
 /// Range searched around the rough tempo, as a fraction.
 const SEARCH_RANGE: f64 = 0.03;
-/// A whole-number BPM is used if its fit is at least this fraction of the best.
-const ROUND_BPM_TOLERANCE: f64 = 0.97;
+/// A whole-number BPM is used if, over the whole track, it drifts from the best fit
+/// by no more than this (seconds): close enough that nobody could hear it.
+const ROUND_BPM_MAX_DRIFT: f64 = 0.008;
 /// Fewer kicks than this give no grid.
 const MIN_KICKS: usize = 16;
 /// Kick spacings accepted for the rough tempo, in seconds.
@@ -39,7 +41,25 @@ pub fn estimate(kicks: &[u64], sample_rate: u32) -> Option<GridEstimate> {
     let rough_bpm = rough_bpm(kicks, sr)?;
     let rough_period = 60.0 * sr / rough_bpm;
     let times: Vec<f64> = kicks.iter().map(|&k| k as f64).collect();
+    let (grid, confidence) = refine(&times, rough_period, sr);
+    Some(GridEstimate { grid, confidence })
+}
 
+/// The constant-tempo grid that `beats` (frames, ascending: beat positions from a beat
+/// tracker) fit best, around their median spacing.
+pub fn fit_beats(beats: &[f64], sample_rate: u32) -> Option<BeatGrid> {
+    if beats.len() < 8 {
+        return None;
+    }
+    let mut spacings: Vec<f64> = beats.windows(2).map(|w| w[1] - w[0]).collect();
+    spacings.sort_by(f64::total_cmp);
+    let rough_period = spacings[spacings.len() / 2];
+    Some(refine(beats, rough_period, sample_rate as f64).0)
+}
+
+/// Search near `rough_period` for the period at which `times` line up best; returns
+/// the grid and how well they fit it (0..1).
+fn refine(times: &[f64], rough_period: f64, sr: f64) -> (BeatGrid, f64) {
     // Step size: over the length of the track, a period error of one step moves the
     // last beat by well under a tenth of a beat.
     let span = times[times.len() - 1] - times[0];
@@ -50,7 +70,7 @@ pub fn estimate(kicks: &[u64], sample_rate: u32) -> Option<GridEstimate> {
     let mut best = (rough_period, 0.0);
     let mut period = low;
     while period <= high {
-        let fit = fit(&times, period).0;
+        let fit = fit(times, period).0;
         if fit > best.1 {
             best = (period, fit);
         }
@@ -61,28 +81,25 @@ pub fn estimate(kicks: &[u64], sample_rate: u32) -> Option<GridEstimate> {
     for _ in 0..40 {
         let a = lo + (hi - lo) / 3.0;
         let b = hi - (hi - lo) / 3.0;
-        match fit(&times, a).0 < fit(&times, b).0 {
+        match fit(times, a).0 < fit(times, b).0 {
             true => lo = a,
             false => hi = b,
         }
     }
     let mut period = (lo + hi) / 2.0;
-    let mut score = fit(&times, period).0;
+    let mut score = fit(times, period).0;
 
     let bpm = 60.0 * sr / period;
     let round_period = 60.0 * sr / bpm.round();
-    let round_score = fit(&times, round_period).0;
-    if round_score >= score * ROUND_BPM_TOLERANCE {
+    let drift = (round_period - period).abs() * span / period;
+    if drift <= ROUND_BPM_MAX_DRIFT * sr {
         period = round_period;
-        score = round_score;
+        score = fit(times, round_period).0;
     }
 
-    let (_, angle) = fit(&times, period);
+    let (_, angle) = fit(times, period);
     let anchor = (angle / std::f64::consts::TAU * period).rem_euclid(period);
-    Some(GridEstimate {
-        grid: BeatGrid { anchor, period },
-        confidence: score,
-    })
+    (BeatGrid { anchor, period }, score)
 }
 
 /// How well `times` fit a grid of `period` (0..1), and the grid's phase angle.

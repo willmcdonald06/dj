@@ -12,8 +12,13 @@ dj-engine.workspace = true
 dj-analysis.workspace = true
 rubato.workspace = true
 symphonia.workspace = true
+realfft.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -24,8 +24,11 @@ use dj_library::{AnalysisSource, Library, Sidecar, TrackAnalysis, TrackTags, sid
 
 const RESCAN_INTERVAL: Duration = Duration::from_secs(120);
 const DRIVE_POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// Grids the in-app analysis is less sure of than this are not used.
-pub const MIN_GRID_CONFIDENCE: f64 = 0.6;
+/// Grids the in-app analysis is less sure of than this are not used for sync. The
+/// confidence is the share of the track's onset weight on the grid's beats; measured
+/// against a neural beat tracker, every right grid scored at least 0.18, and most
+/// tracks below it have no steady tempo (live drummers, tempo changes).
+pub const MIN_GRID_CONFIDENCE: f64 = 0.18;
 /// Sample rate for background analysis (results are stored in seconds).
 const ANALYSIS_RATE: u32 = 48_000;
 
@@ -325,10 +328,14 @@ pub fn trusted_grid(analysis: &Analysis) -> Option<BeatGrid> {
         .map(|g| g.grid)
 }
 
+/// An audio file to list in the library (stems files are audio but belong to their
+/// track).
 fn is_audio(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| dj_loader::AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    !dj_loader::is_stems_file(path)
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| dj_loader::AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// All audio files under `dir`, skipping hidden files and folders (macOS `._` files,

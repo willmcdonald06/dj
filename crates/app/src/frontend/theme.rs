@@ -2,7 +2,7 @@
 //! accents, lit buttons, hot cues, keys and meters.
 
 use dj_analysis::{Key, Mode};
-use dj_engine::HOT_CUES;
+use dj_engine::{HOT_CUES, STEM_COUNT};
 use dj_ui::Color;
 
 /// Window background, between panels.
@@ -50,6 +50,14 @@ pub const HOT_CUE_COLORS: [Color; HOT_CUES] = [
     Color::rgb(0.2, 0.45, 0.95),
     Color::rgb(0.6, 0.3, 0.95),
     Color::rgb(0.95, 0.35, 0.75),
+];
+
+/// Stem colours: vocals, melody, bass, drums.
+pub const STEM_COLORS: [Color; STEM_COUNT] = [
+    Color::rgb(0.25, 0.85, 0.3),
+    Color::rgb(0.95, 0.85, 0.15),
+    Color::rgb(0.95, 0.2, 0.2),
+    Color::rgb(0.15, 0.8, 0.85),
 ];
 
 /// Meter colours, bottom to top.

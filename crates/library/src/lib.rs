@@ -23,7 +23,7 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 /// Schema version, kept in SQLite's `user_version`.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 /// How long a connection waits for another's write to finish.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -232,6 +232,17 @@ impl Library {
                      PRIMARY KEY (collection_id, track_id)
                  );
                  PRAGMA user_version = 3;
+                 COMMIT;",
+            )?;
+        }
+        if version < 4 {
+            // A beatgrid set by hand: kept apart from the analysis, which can be
+            // redone, and preferred over it.
+            self.conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE tracks ADD COLUMN user_bpm REAL;
+                 ALTER TABLE tracks ADD COLUMN user_grid_anchor REAL;
+                 PRAGMA user_version = 4;
                  COMMIT;",
             )?;
         }
@@ -557,6 +568,40 @@ impl Library {
     }
 
     /// The hot cues saved for the track at `path`, by slot.
+    /// The beatgrid set by hand for `path`, if any: BPM and a downbeat in seconds.
+    pub fn user_grid(&self, path: &Path) -> Result<Option<(f64, f64)>, LibraryError> {
+        let grid = self
+            .conn
+            .query_row(
+                "SELECT user_bpm, user_grid_anchor FROM tracks WHERE path = ?1",
+                [path.to_string_lossy()],
+                |r| Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<f64>>(1)?)),
+            )
+            .optional()?;
+        Ok(match grid {
+            Some((Some(bpm), Some(anchor))) => Some((bpm, anchor)),
+            _ => None,
+        })
+    }
+
+    /// Keep (or with `None`, forget) a beatgrid set by hand for `path`: BPM and a
+    /// downbeat in seconds. It survives re-analysis and sidecars.
+    pub fn set_user_grid(
+        &mut self,
+        path: &Path,
+        grid: Option<(f64, f64)>,
+    ) -> Result<(), LibraryError> {
+        let (bpm, anchor) = match grid {
+            Some((bpm, anchor)) => (Some(bpm), Some(anchor)),
+            None => (None, None),
+        };
+        self.conn.execute(
+            "UPDATE tracks SET user_bpm = ?2, user_grid_anchor = ?3 WHERE path = ?1",
+            params![path.to_string_lossy(), bpm, anchor],
+        )?;
+        Ok(())
+    }
+
     pub fn hot_cues(&self, path: &Path) -> Result<Vec<StoredCue>, LibraryError> {
         let Some(track) = self.track_id(path)? else {
             return Ok(Vec::new());
@@ -606,7 +651,9 @@ impl Library {
     }
 }
 
-const TRACK_COLUMNS: &str = "id, path, title, artist, album, duration, bpm, grid_anchor, \
+/// A grid set by hand wins over the analysis's.
+const TRACK_COLUMNS: &str = "id, path, title, artist, album, duration, \
+                             COALESCE(user_bpm, bpm), COALESCE(user_grid_anchor, grid_anchor), \
                              key_pitch, key_minor, analysis_source, added";
 
 fn track_from_row(r: &Row<'_>) -> rusqlite::Result<Track> {
@@ -850,6 +897,36 @@ mod tests {
             library.tracks().unwrap().len(),
             3,
             "tracks stay in the library"
+        );
+    }
+
+    #[test]
+    fn a_grid_set_by_hand_beats_the_analysis_until_cleared() {
+        let mut library = Library::open_in_memory().unwrap();
+        let path = Path::new("/music/a.flac");
+        library.upsert_scanned(path, 1, 1, &tags("A"), 0).unwrap();
+        let analysed = TrackAnalysis {
+            bpm: Some(127.9),
+            grid_anchor: Some(0.1),
+            key: None,
+        };
+        library
+            .set_analysis(path, &analysed, AnalysisSource::App, 1, None)
+            .unwrap();
+        assert_eq!(library.user_grid(path).unwrap(), None);
+        library.set_user_grid(path, Some((128.0, 0.25))).unwrap();
+        // Re-analysis doesn't touch it.
+        library
+            .set_analysis(path, &analysed, AnalysisSource::App, 2, None)
+            .unwrap();
+        assert_eq!(library.user_grid(path).unwrap(), Some((128.0, 0.25)));
+        let track = library.track(path).unwrap().unwrap();
+        assert_eq!(track.analysis.bpm, Some(128.0));
+        assert_eq!(track.analysis.grid_anchor, Some(0.25));
+        library.set_user_grid(path, None).unwrap();
+        assert_eq!(
+            library.track(path).unwrap().unwrap().analysis.bpm,
+            Some(127.9)
         );
     }
 

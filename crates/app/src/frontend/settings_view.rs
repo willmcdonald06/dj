@@ -1,0 +1,234 @@
+//! The settings screen: a panel over everything, one row per setting, each changed with
+//! ◂ ▸ (or by clicking its value). Changes apply and save at once.
+
+use dj_ui::{Align, Color, Rect};
+
+use super::layout::{Area, Layout};
+use super::painter::{Icon, Painter};
+use super::theme::*;
+use super::{Control, UiAction};
+
+/// One line on the settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingRow {
+    Device,
+    Buffer,
+    Output,
+    TempoRange,
+    KeyLock,
+    KeyNotation,
+    Waveform,
+}
+
+impl SettingRow {
+    pub const ALL: [SettingRow; 7] = [
+        SettingRow::Device,
+        SettingRow::Buffer,
+        SettingRow::Output,
+        SettingRow::TempoRange,
+        SettingRow::KeyLock,
+        SettingRow::KeyNotation,
+        SettingRow::Waveform,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingRow::Device => "Output device",
+            SettingRow::Buffer => "Buffer size",
+            SettingRow::Output => "Outputs",
+            SettingRow::TempoRange => "Tempo range",
+            SettingRow::KeyLock => "Key lock at start",
+            SettingRow::KeyNotation => "Key notation",
+            SettingRow::Waveform => "Waveform colours",
+        }
+    }
+
+    /// The heading this row sits under.
+    fn section(self) -> &'static str {
+        match self {
+            SettingRow::Device | SettingRow::Buffer | SettingRow::Output => "AUDIO",
+            SettingRow::TempoRange | SettingRow::KeyLock => "DECKS",
+            SettingRow::KeyNotation | SettingRow::Waveform => "DISPLAY",
+        }
+    }
+
+    /// The row `by` places away, clamped to the list.
+    pub fn moved(self, by: i32) -> Self {
+        let i = Self::ALL.iter().position(|&r| r == self).unwrap_or(0) as i32;
+        Self::ALL[(i + by).clamp(0, Self::ALL.len() as i32 - 1) as usize]
+    }
+}
+
+/// What the settings screen's controls do.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SettingsAction {
+    Open,
+    Close,
+    Select(SettingRow),
+    /// Choose the previous (-1) or next (+1) value.
+    Step(SettingRow, i32),
+    /// A click on the panel that hits nothing: keeps it open.
+    Nothing,
+}
+
+/// One row as shown: the current value and a line of detail under it.
+pub struct RowView {
+    pub row: SettingRow,
+    pub value: String,
+    pub detail: String,
+    /// Detail drawn as a warning (e.g. the device fell back to another setup).
+    pub warn: bool,
+}
+
+pub struct SettingsView<'a> {
+    pub rows: &'a [RowView],
+    pub selected: SettingRow,
+    /// Where the settings are saved.
+    pub path: &'a str,
+}
+
+impl Painter {
+    pub fn settings(&mut self, layout: &Layout, v: SettingsView<'_>) {
+        self.popup(|p| {
+            let screen = Area::new(0.0, 0.0, layout.width, layout.height);
+            p.fill(screen, Color::rgba(0.0, 0.0, 0.0, 0.7));
+            p.hit(
+                screen,
+                Control::Button(UiAction::Settings(SettingsAction::Close)),
+            );
+
+            let row_h = p.px(46.0);
+            let heading_h = p.px(24.0);
+            let sections = 3.0;
+            let w = p.px(640.0).min(layout.width - p.px(32.0));
+            let h = (row_h * v.rows.len() as f32 + heading_h * sections + p.px(118.0))
+                .min(layout.height - p.px(16.0));
+            let panel = Area::new((layout.width - w) / 2.0, (layout.height - h) / 2.0, w, h);
+            p.push(
+                Rect::new(
+                    panel.x,
+                    panel.y,
+                    panel.width,
+                    panel.height,
+                    Color::rgb(0.05, 0.05, 0.06),
+                )
+                .gradient(Color::rgb(0.03, 0.03, 0.037))
+                .rounded(p.px(8.0)),
+            );
+            p.push(
+                Rect::new(panel.x, panel.y, panel.width, panel.height, LINE)
+                    .rounded(p.px(8.0))
+                    .stroke(p.px(1.0)),
+            );
+            p.hit(
+                panel,
+                Control::Button(UiAction::Settings(SettingsAction::Nothing)),
+            );
+
+            let inner = panel.inset(p.px(20.0));
+            let (title, rest) = inner.split_top(p.px(28.0), p.px(8.0));
+            p.bold(title, "Settings", 16.0, TEXT, Align::Left);
+            let (close, hints) = title.split_right(p.px(72.0), p.px(12.0));
+            p.label(
+                hints,
+                "↑↓ choose   ◂ ▸ change   Esc close",
+                10.0,
+                SOFT_TEXT,
+                Align::Right,
+            );
+            p.button(
+                close,
+                "CLOSE",
+                false,
+                TEXT,
+                UiAction::Settings(SettingsAction::Close),
+            );
+
+            let (list, footer) = rest.split_top(rest.height - p.px(28.0), p.px(4.0));
+            let mut y = list.y;
+            let mut section = "";
+            for row in v.rows {
+                if row.row.section() != section {
+                    section = row.row.section();
+                    let heading = Area::new(list.x, y, list.width, heading_h);
+                    p.bold(heading, section, 10.0, SOFT_TEXT, Align::Left);
+                    y += heading_h;
+                }
+                let area = Area::new(list.x, y, list.width, row_h);
+                p.setting_row(area, row, row.row == v.selected);
+                y += row_h;
+            }
+
+            p.label(
+                footer,
+                format!("Changes apply at once and are saved to {}", v.path),
+                10.0,
+                SOFT_TEXT,
+                Align::Left,
+            );
+        });
+    }
+
+    fn setting_row(&mut self, area: Area, row: &RowView, selected: bool) {
+        let id = row.row;
+        if selected {
+            self.rounded(area, self.px(4.0), SELECTED_ROW);
+        }
+        self.hit(
+            area,
+            Control::Button(UiAction::Settings(SettingsAction::Select(id))),
+        );
+        let inner = area.inset_x(self.px(10.0));
+        let (label, rest) = inner.split_left(self.px(150.0), self.px(10.0));
+        self.label(label, id.label(), 12.0, TEXT, Align::Left);
+
+        let control_h = self.px(26.0);
+        let top = area.y + self.px(4.0);
+        let step = self.px(26.0);
+        let value_w = (rest.width - step * 2.0 - self.px(8.0)).max(self.px(60.0));
+        let prev = Area::new(rest.x, top, step, control_h);
+        let value = Area::new(prev.right() + self.px(4.0), top, value_w, control_h);
+        let next = Area::new(value.right() + self.px(4.0), top, step, control_h);
+        self.icon_button(
+            prev,
+            Icon::Left,
+            false,
+            TEXT,
+            UiAction::Settings(SettingsAction::Step(id, -1)),
+        );
+        self.well(value);
+        let ink = match selected {
+            true => TEXT,
+            false => Color::rgb(0.7, 0.7, 0.74),
+        };
+        self.bold(
+            value.inset_x(self.px(8.0)),
+            &row.value,
+            11.0,
+            ink,
+            Align::Left,
+        );
+        self.hit(
+            value,
+            Control::Button(UiAction::Settings(SettingsAction::Step(id, 1))),
+        );
+        self.icon_button(
+            next,
+            Icon::Right,
+            false,
+            TEXT,
+            UiAction::Settings(SettingsAction::Step(id, 1)),
+        );
+        let detail = Area::new(
+            value.x + self.px(8.0),
+            value.bottom(),
+            value.width,
+            area.bottom() - value.bottom(),
+        );
+        let ink = match row.warn {
+            true => WARNING,
+            false => SOFT_TEXT,
+        };
+        self.label(detail, &row.detail, 10.0, ink, Align::Left);
+    }
+}

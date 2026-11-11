@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use dj_engine::{
     ChannelControl, Command, DeckAction, DeckId, DeckSnapshot, EngineSnapshot, HOT_CUES, HotCue,
-    Transport,
+    STEM_COUNT, Stem, Transport,
 };
 
 use crate::{Mapping, MidiMessage, RawMessage, UiEvent};
@@ -51,6 +51,8 @@ const NOTE_MODE_HOT_CUE: u8 = 0x00;
 const NOTE_MODE_ROLL: u8 = 0x08;
 /// The LOOP pad mode button; we use it for beat jump.
 const NOTE_MODE_LOOP: u8 = 0x0D;
+/// The SAMPLER pad mode button; we use it for stems (the app has no sampler yet).
+const NOTE_MODE_SAMPLER: u8 = 0x0B;
 const NOTE_PAD_FIRST: u8 = 0x14;
 /// SHIFT + pad.
 const NOTE_PAD_SHIFTED_FIRST: u8 = 0x1C;
@@ -70,6 +72,8 @@ const PAD_DIM: u8 = 0x10;
 const HOT_CUE_PAD_COLORS: [u8; HOT_CUES] = [0x01, 0x02, 0x04, 0x05, 0x0C, 0x03, 0x08, 0x06];
 const ROLL_BEATS: [f32; 8] = [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
 const JUMP_BEATS: [f32; 8] = [-1.0, -2.0, -4.0, -8.0, 1.0, 2.0, 4.0, 8.0];
+/// Stem pad colours: vocals, melody, bass, drums (matching the screen).
+const STEM_PAD_COLORS: [u8; STEM_COUNT] = [0x05, 0x04, 0x01, 0x03];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum PadMode {
@@ -77,6 +81,8 @@ enum PadMode {
     HotCue,
     Roll,
     Jump,
+    /// Pads 1–4 mute and unmute the stems; 5–8 play one stem alone.
+    Stems,
 }
 
 // Browser section, on MIDI channel 16.
@@ -104,8 +110,12 @@ const FOURTEEN_BIT: [(u8, u8, Target); 6] = [
 /// Rate offset added per jog tick when nudging. Ticks come faster the faster the jog
 /// turns, so the bend follows the jog's speed.
 pub const NUDGE_PER_TICK: f32 = 0.002;
-/// Playhead movement per jog tick when the top is touched on a stopped deck.
-pub const SEARCH_SECONDS_PER_TICK: f32 = 0.01;
+/// Track movement per jog tick while the top is touched (scratching).
+pub const SCRATCH_SECONDS_PER_TICK: f32 = JOG_SECONDS_PER_REV / JOG_TICKS_PER_REV;
+/// Jog ticks per revolution of the platter.
+const JOG_TICKS_PER_REV: f32 = 512.0;
+/// Track time per platter revolution: a record at 45 rpm (as Mixxx maps the 505).
+const JOG_SECONDS_PER_REV: f32 = 60.0 / 45.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Target {
@@ -180,7 +190,17 @@ impl Dj505 {
             (NOTE_PLAY, true) => emit(Command::deck(deck, DeckAction::PlayPause)),
             (NOTE_CUE, true) => emit(Command::deck(deck, DeckAction::CuePress)),
             (NOTE_CUE, false) => emit(Command::deck(deck, DeckAction::CueRelease)),
-            (NOTE_JOG_TOUCH, _) => self.jog_touched[d] = down,
+            (NOTE_JOG_TOUCH, _) => {
+                // Hand on the platter: scratch, like a record (playing or not).
+                if down != self.jog_touched[d] {
+                    self.jog_touched[d] = down;
+                    let action = match down {
+                        true => DeckAction::ScratchStart,
+                        false => DeckAction::ScratchEnd,
+                    };
+                    emit(Command::deck(deck, action));
+                }
+            }
             (NOTE_TEMPO_RANGE, true) => emit(Command::deck(deck, DeckAction::CycleTempoRange)),
             (NOTE_KEY_LOCK, true) => emit(Command::deck(deck, DeckAction::ToggleKeyLock)),
             (NOTE_SYNC, true) => emit(Command::deck(deck, DeckAction::ToggleSyncLock)),
@@ -198,6 +218,7 @@ impl Dj505 {
             (NOTE_MODE_HOT_CUE, true) => self.set_pad_mode(d, PadMode::HotCue),
             (NOTE_MODE_ROLL, true) => self.set_pad_mode(d, PadMode::Roll),
             (NOTE_MODE_LOOP, true) => self.set_pad_mode(d, PadMode::Jump),
+            (NOTE_MODE_SAMPLER, true) => self.set_pad_mode(d, PadMode::Stems),
             (NOTE_LOOP_IN, true) => emit(act(DeckAction::LoopIn)),
             (NOTE_LOOP_OUT, true) => emit(act(DeckAction::LoopOut)),
             (NOTE_AUTO_LOOP, true) => emit(act(DeckAction::AutoLoop { beats: 4.0 })),
@@ -217,6 +238,11 @@ impl Dj505 {
                         beats: JUMP_BEATS[pad],
                     }),
                     (PadMode::Jump, false) => None,
+                    (PadMode::Stems, true) => Some(match pad < STEM_COUNT {
+                        true => DeckAction::ToggleStem(Stem::ALL[pad]),
+                        false => DeckAction::SoloStem(Stem::ALL[pad - STEM_COUNT]),
+                    }),
+                    (PadMode::Stems, false) => None,
                 };
                 if let Some(action) = action {
                     emit(act(action));
@@ -252,6 +278,25 @@ impl Dj505 {
                     false => PAD_GREEN | PAD_DIM,
                 },
                 PadMode::Jump => PAD_WHITE | PAD_DIM,
+                PadMode::Stems => {
+                    let stem = pad % STEM_COUNT;
+                    let playing = !state.stems.muted[stem];
+                    match (state.stems.available, pad < STEM_COUNT, playing) {
+                        (false, _, _) => PAD_OFF,
+                        // Toggles: bright while the stem plays, dim while muted.
+                        (true, true, true) => STEM_PAD_COLORS[stem],
+                        (true, true, false) => STEM_PAD_COLORS[stem] | PAD_DIM,
+                        // Solo pads: bright while that stem plays alone.
+                        (true, false, _) => {
+                            let alone =
+                                (0..STEM_COUNT).all(|s| state.stems.muted[s] == (s != stem));
+                            match alone {
+                                true => STEM_PAD_COLORS[stem],
+                                false => STEM_PAD_COLORS[stem] | PAD_DIM,
+                            }
+                        }
+                    }
+                }
             };
         }
         colors
@@ -261,10 +306,9 @@ impl Dj505 {
         let d = deck.index();
         if control == CC_JOG {
             let ticks = value as f32 - 64.0;
-            let stopped = self.transport[d] == Transport::Stopped;
-            let action = match self.jog_touched[d] && stopped {
-                true => DeckAction::SeekBy {
-                    seconds: ticks * SEARCH_SECONDS_PER_TICK,
+            let action = match self.jog_touched[d] {
+                true => DeckAction::ScratchMove {
+                    seconds: ticks * SCRATCH_SECONDS_PER_TICK,
                 },
                 false => DeckAction::Nudge {
                     amount: ticks * NUDGE_PER_TICK,
@@ -678,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn jog_nudges_unless_top_touched_on_stopped_deck() {
+    fn jog_nudges_from_the_side_and_scratches_from_the_top() {
         let mut m = Dj505::new();
         assert_eq!(
             feed(&mut m, &[0xB0, 0x06, 66]),
@@ -689,15 +733,22 @@ mod tests {
                 }
             )]
         );
-        feed(&mut m, &[0x90, 0x06, 0x7F]);
+        assert_eq!(
+            feed(&mut m, &[0x90, 0x06, 0x7F]),
+            vec![Command::deck(DeckId::A, DeckAction::ScratchStart)]
+        );
         assert_eq!(
             feed(&mut m, &[0xB0, 0x06, 62]),
             vec![Command::deck(
                 DeckId::A,
-                DeckAction::SeekBy {
-                    seconds: -2.0 * SEARCH_SECONDS_PER_TICK
+                DeckAction::ScratchMove {
+                    seconds: -2.0 * SCRATCH_SECONDS_PER_TICK
                 }
             )]
+        );
+        assert_eq!(
+            feed(&mut m, &[0x90, 0x06, 0x00]),
+            vec![Command::deck(DeckId::A, DeckAction::ScratchEnd)]
         );
     }
 

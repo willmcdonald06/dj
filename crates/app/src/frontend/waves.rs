@@ -28,7 +28,7 @@ const PLAYED_BRIGHTNESS: f32 = 0.55;
 
 impl Painter {
     /// One deck's scrolling waveform, centred on the playhead. `base_fpp` is frames per
-    /// pixel at 1:1 tempo; it is scaled by the deck's speed so both decks scroll at the
+    /// pixel at 1:1 tempo; it is scaled by the deck's tempo so both decks scroll at the
     /// same real-time rate and matched beats line up. Bar lines run on to `grid_to`
     /// (the middle of the transient strip), joining the deck's spikes.
     pub fn scrolling(
@@ -444,9 +444,11 @@ impl Painter {
 }
 
 /// The track frame at the left edge of a scrolling view `width` pixels wide, and its
-/// frames per pixel: centred on the playhead, scaled by the deck's speed.
+/// frames per pixel: centred on the playhead, scaled by the deck's tempo. Not by a
+/// nudge: that should be seen sliding the waveform along (so its beats can be walked
+/// onto the other deck's), not stretching it.
 fn view_window(d: &DeckSnapshot, width: f32, base_fpp: f64) -> (f64, f64) {
-    let speed = (d.tempo_rate + d.nudge).max(0.01) as f64;
+    let speed = d.tempo_rate.max(0.01) as f64;
     let fpp = base_fpp * speed;
     (d.position as f64 - (width as f64 / 2.0) * fpp, fpp)
 }

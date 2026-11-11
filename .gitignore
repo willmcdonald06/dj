@@ -17,9 +17,11 @@ core.*
 !/test-data/README.md
 !/test-data/tone-*
 
-# Analysis sidecars written next to tracks (tools/analyze)
+# Analysis sidecars written next to tracks, and beat references (tools/analyze)
 *.dj.json
 *.dj.json.tmp
+/refs/
+/sample.txt
 
 # Local library databases and screenshots from --screenshot runs
 *.db

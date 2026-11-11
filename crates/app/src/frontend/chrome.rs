@@ -1,19 +1,22 @@
 //! Around the decks: the top bar, notices and the keyboard help.
 
 use dj_audio_io::{HISTOGRAM_BUCKETS, StatsSnapshot};
+use dj_engine::{DeckId, FxControl, FxSnapshot, FxTarget};
 use dj_ui::{Align, Color, Rect};
 
+use super::deck_view::beats_label;
 use super::layout::{Area, Layout};
 use super::painter::Painter;
 use super::theme::*;
-use super::{Control, UiAction};
+use super::{Control, Slider, UiAction};
 
 /// Keyboard shortcuts, as shown by HELP: (keys, what they do).
-const SHORTCUTS: [(&str, &str); 23] = [
+const SHORTCUTS: [(&str, &str); 30] = [
     ("Space", "play / pause the selected deck"),
     ("C (hold)", "cue"),
     ("Tab", "select the other deck"),
-    ("1 – 8", "hot cues"),
+    ("1 – 8", "hot cues (stem pads in STEMS mode)"),
+    ("M", "pads: STEMS / HOT CUE"),
     ("I / O", "loop in / out"),
     ("L", "4-beat loop"),
     ("[ / ]", "halve / double the loop"),
@@ -28,9 +31,15 @@ const SHORTCUTS: [(&str, &str); 23] = [
     ("P", "headphone cue"),
     ("E", "eject"),
     ("+ / −", "zoom the waveforms"),
+    ("F", "beat FX on / off"),
+    ("G", "next effect"),
+    ("Z / X", "FX length shorter / longer"),
+    ("V", "tap the FX tempo"),
     ("B", "browser keys: ↑/↓ select, Enter load"),
     ("/", "search the browser"),
     ("Esc", "leave the browser or search"),
+    ("W", "record the main output on / off"),
+    ("U", "settings (also the button at the top right)"),
     ("T", "test tone"),
     ("F11", "fullscreen on / off"),
 ];
@@ -42,6 +51,9 @@ pub struct TopBar<'a> {
     pub help: bool,
     /// Kick offset between the decks while both play.
     pub phase_ms: Option<f64>,
+    pub fx: FxSnapshot,
+    /// Seconds recorded so far, while recording.
+    pub recording: Option<f64>,
 }
 
 impl Painter {
@@ -66,16 +78,31 @@ impl Painter {
         // Left: the name, then audio health.
         let (name, rest) = inner.split_left(self.px(30.0), self.px(12.0));
         self.bold(name, "dj", 15.0, TEXT, Align::Left);
-        let (health, rest) = rest.split_left(self.px(200.0), self.px(12.0));
+        let (health, rest) = rest.split_left(self.px(118.0), self.px(10.0));
         self.audio_health(health, v.stats);
+        // REC lights up and shows how long it has been recording.
+        let (rec, rest) = rest.split_left(self.px(60.0), self.px(8.0));
+        let label = match v.recording {
+            Some(seconds) => crate::recorder::clock(seconds),
+            None => "REC".to_string(),
+        };
+        self.button(rec, &label, v.recording.is_some(), DANGER, UiAction::Record);
 
-        // Right: help, zoom, quantize.
+        // Right: settings, help, zoom, quantize.
         let gap = self.px(6.0);
-        let (help, rest) = rest.split_right(self.px(52.0), gap * 2.0);
-        self.button(help, "HELP", v.help, TEXT, UiAction::Help);
+        let (settings, rest) = rest.split_right(self.px(30.0), gap);
+        self.icon_button(
+            settings,
+            super::painter::Icon::Settings,
+            false,
+            TEXT,
+            UiAction::Settings(super::settings_view::SettingsAction::Open),
+        );
+        let (help, rest) = rest.split_right(self.px(26.0), gap * 2.0);
+        self.button(help, "?", v.help, TEXT, UiAction::Help);
         let (zoom_in, rest) = rest.split_right(self.px(28.0), gap);
         self.button(zoom_in, "+", false, TEXT, UiAction::Zoom(1.0 / 1.25));
-        let (zoom_label, rest) = rest.split_right(self.px(54.0), gap);
+        let (zoom_label, rest) = rest.split_right(self.px(40.0), gap);
         self.label(
             zoom_label,
             format!("{:.1} s", v.zoom_seconds),
@@ -88,11 +115,109 @@ impl Painter {
         let (quantize, rest) = rest.split_right(self.px(86.0), gap);
         self.button(quantize, "QUANTIZE", v.quantize, CUE, UiAction::Quantize);
 
-        // Centre: the phase meter.
-        let w = self.px(300.0);
+        // Centre: the phase meter, with the beat FX either side.
+        let w = self.px(240.0);
         let centre = Area::new(area.centre_x() - w / 2.0, inner.y, w, inner.height);
         if centre.x > rest.x && centre.right() < rest.right() {
             self.phase_meter(centre, v.phase_ms);
+            let left = Area::new(rest.x, rest.y, centre.x - rest.x - gap * 2.0, rest.height);
+            let right_x = centre.right() + gap * 2.0;
+            let right = Area::new(right_x, rest.y, rest.right() - right_x, rest.height);
+            self.fx_controls(left, right, &v.fx);
+        }
+    }
+
+    /// The beat FX: ON, effect and length at `left`; target, level and tempo (TAP) at
+    /// `right`. Parts that don't fit are left out.
+    fn fx_controls(&mut self, left: Area, right: Area, fx: &FxSnapshot) {
+        let gap = self.px(4.0);
+        let step = self.px(20.0);
+        let fx_color = match fx.kind.has_tail() {
+            true => Color::rgb(0.3, 0.6, 1.0),
+            false => FILTER,
+        };
+        let needed = self.px(44.0 + 20.0 * 4.0 + 66.0 + 36.0) + gap * 7.0;
+        if left.width >= needed {
+            let (on, rest) = left.split_left(self.px(44.0), gap * 2.0);
+            self.button(on, "FX", fx.on, fx_color, UiAction::Fx(FxControl::ToggleOn));
+            let (prev, rest) = rest.split_left(step, gap);
+            self.icon_button(
+                prev,
+                super::painter::Icon::Left,
+                false,
+                TEXT,
+                UiAction::Fx(FxControl::StepKind(-1)),
+            );
+            let (kind, rest) = rest.split_left(self.px(66.0), gap);
+            self.well(kind);
+            self.bold(kind, fx.kind.label(), 10.0, fx_color, Align::Center);
+            self.hit(kind, Control::Button(UiAction::Fx(FxControl::StepKind(1))));
+            let (next, rest) = rest.split_left(step, gap * 2.0);
+            self.icon_button(
+                next,
+                super::painter::Icon::Right,
+                false,
+                TEXT,
+                UiAction::Fx(FxControl::StepKind(1)),
+            );
+            let (shorter, rest) = rest.split_left(step, gap);
+            self.icon_button(
+                shorter,
+                super::painter::Icon::Left,
+                false,
+                TEXT,
+                UiAction::Fx(FxControl::StepBeats(-1)),
+            );
+            let (beats, rest) = rest.split_left(self.px(36.0), gap);
+            self.label(beats, beats_label(fx.beats), 11.0, TEXT, Align::Center);
+            let (longer, _) = rest.split_left(step, gap);
+            self.icon_button(
+                longer,
+                super::painter::Icon::Right,
+                false,
+                TEXT,
+                UiAction::Fx(FxControl::StepBeats(1)),
+            );
+        }
+
+        let needed = self.px(24.0 * 2.0 + 40.0 + 26.0 + 36.0 + 28.0) + gap * 6.0;
+        if right.width >= needed {
+            let mut rest = right;
+            let targets = [
+                ("A", FxTarget::Deck(DeckId::A), DECK_COLORS[0]),
+                ("B", FxTarget::Deck(DeckId::B), DECK_COLORS[1]),
+                ("MAIN", FxTarget::Main, TEXT),
+            ];
+            for (label, target, color) in targets {
+                let w = match target {
+                    FxTarget::Main => self.px(40.0),
+                    FxTarget::Deck(_) => self.px(24.0),
+                };
+                let (cell, after) = rest.split_left(w, gap);
+                self.button(
+                    cell,
+                    label,
+                    fx.target == target,
+                    color,
+                    UiAction::Fx(FxControl::SetTarget(target)),
+                );
+                rest = after;
+            }
+            let (level, rest) = rest.split_left(self.px(26.0), gap * 2.0);
+            self.small_knob(level, fx.level, fx_color, Slider::FxLevel);
+            // TAP shows the FX tempo; once tapped, a click on the tempo goes back to
+            // following the decks.
+            let (tap, rest) = rest.split_left(self.px(36.0), gap);
+            self.button(tap, "TAP", fx.tapped, CUE, UiAction::Fx(FxControl::Tap));
+            let (bpm, _) = rest.split_left(self.px(28.0), 0.0);
+            let ink = match fx.tapped {
+                true => CUE,
+                false => SOFT_TEXT,
+            };
+            self.label(bpm, format!("{:.0}", fx.bpm), 10.0, ink, Align::Left);
+            if fx.tapped {
+                self.hit(bpm, Control::Button(UiAction::Fx(FxControl::AutoTempo)));
+            }
         }
     }
 

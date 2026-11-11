@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
-use dj_engine::{Engine, EngineConfig};
+use dj_engine::{Engine, EngineConfig, OutputMode, OutputRouting};
 
 /// Largest chunk rendered by the engine in one go. Device buffers larger than this are
 /// rendered in several chunks, so the scratch buffer has a fixed size.
@@ -45,6 +45,10 @@ pub enum AudioError {
     Cpal(#[from] cpal::Error),
     #[error("the audio stream stopped responding while restarting it")]
     Restart,
+    #[error("per-deck outputs need a device with 4 outputs; {device:?} has {channels}")]
+    NeedsFourChannels { device: String, channels: usize },
+    #[error("{0}; the audio stream couldn't be restarted, so there is no sound")]
+    Lost(Box<AudioError>),
 }
 
 /// Largest buffer the watchdog grows to.
@@ -165,8 +169,10 @@ impl OpenDevice {
     /// Start the stream, moving `engine` onto the audio thread.
     pub fn start(mut self, engine: Engine) -> Result<AudioOutput, AudioError> {
         let stats = Arc::new(CallbackStats::new());
-        let running = self.run(engine, &stats)?;
+        let mode = engine.config().routing.mode;
+        let running = self.run(&mut Some(engine), &stats)?;
         Ok(AudioOutput {
+            mode,
             open: self,
             running: Some(running),
             stats,
@@ -175,8 +181,13 @@ impl OpenDevice {
     }
 
     /// Build a stream (falling back to the device's default buffer if a fixed size is
-    /// rejected), hand it `engine` and start it.
-    fn run(&mut self, engine: Engine, stats: &Arc<CallbackStats>) -> Result<Running, AudioError> {
+    /// rejected), hand it the engine and start it. The engine is taken out of `engine`
+    /// only once a stream exists, so on a failed build the caller still has it.
+    fn run(
+        &mut self,
+        engine: &mut Option<Engine>,
+        stats: &Arc<CallbackStats>,
+    ) -> Result<Running, AudioError> {
         let built = match self.build_stream(stats) {
             Ok(built) => built,
             Err(err) if self.fixed_buffer => {
@@ -198,6 +209,9 @@ impl OpenDevice {
             returned,
             release,
         } = built;
+        let Some(engine) = engine.take() else {
+            return Err(AudioError::Restart);
+        };
         if handoff.push(engine).is_err() {
             unreachable!("handoff queue has room for exactly one engine");
         }
@@ -292,6 +306,7 @@ impl Watchdog {
 /// A running output stream. Dropping it stops audio.
 pub struct AudioOutput {
     open: OpenDevice,
+    mode: OutputMode,
     running: Option<Running>,
     stats: Arc<CallbackStats>,
     watchdog: Watchdog,
@@ -350,8 +365,93 @@ impl AudioOutput {
         Some(result)
     }
 
+    /// The fixed period size in use, or `None` when the device picks it.
+    pub fn buffer_frames(&self) -> Option<u32> {
+        match self.open.stream_config.buffer_size {
+            cpal::BufferSize::Fixed(frames) => Some(frames),
+            cpal::BufferSize::Default => None,
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.open.channels()
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.open.sample_rate()
+    }
+
+    /// The output mode the engine is routed for.
+    pub fn output_mode(&self) -> OutputMode {
+        self.mode
+    }
+
     /// Reopen the stream with a `frames` buffer, keeping the engine and its state.
     pub fn restart_with_buffer(&mut self, frames: u32) -> Result<(), AudioError> {
+        let mut engine = Some(self.take_engine()?);
+        self.open.stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+        self.open.fixed_buffer = true;
+        self.running = Some(self.open.run(&mut engine, &self.stats)?);
+        Ok(())
+    }
+
+    /// Move the engine to another device, buffer size or output mode without losing
+    /// its state (decks keep playing after a short gap). `settings.sample_rate` must be
+    /// the engine's rate. If the new setup can't be opened, the old one is restored and
+    /// the error returned; [`AudioError::Lost`] means even that failed.
+    pub fn reconfigure(
+        &mut self,
+        settings: &AudioSettings,
+        mode: OutputMode,
+    ) -> Result<(), AudioError> {
+        // Choosing a config doesn't touch the running stream.
+        let mut open = OpenDevice::open(settings)?;
+        let routing = OutputRouting::for_mode(mode, open.channels()).ok_or_else(|| {
+            AudioError::NeedsFourChannels {
+                device: open.device_name.clone(),
+                channels: open.channels(),
+            }
+        })?;
+        let mut engine = self.take_engine()?;
+        let old_routing = engine.config().routing;
+        engine.set_routing(routing);
+        let mut engine = Some(engine);
+        match open.run(&mut engine, &self.stats) {
+            Ok(running) => {
+                tracing::info!(
+                    "audio: {} — {} ch, buffer {:?}, {mode:?}",
+                    open.device_name,
+                    open.channels(),
+                    open.stream_config.buffer_size
+                );
+                self.open = open;
+                self.mode = mode;
+                self.running = Some(running);
+                self.watchdog = Watchdog::new();
+                self.watchdog.last_xruns = self.stats.snapshot().xruns;
+                Ok(())
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "can't switch audio ({err}); going back to {}",
+                    self.open.device_name
+                );
+                if let Some(engine) = engine.as_mut() {
+                    engine.set_routing(old_routing);
+                }
+                match self.open.run(&mut engine, &self.stats) {
+                    Ok(running) => {
+                        self.running = Some(running);
+                        Err(err)
+                    }
+                    Err(_) => Err(AudioError::Lost(Box::new(err))),
+                }
+            }
+        }
+    }
+
+    /// Stop the stream and get the engine back from the callback.
+    fn take_engine(&mut self) -> Result<Engine, AudioError> {
         let Some(mut running) = self.running.take() else {
             return Err(AudioError::Restart);
         };
@@ -370,10 +470,7 @@ impl AudioOutput {
             std::thread::sleep(Duration::from_millis(1));
         };
         drop(running);
-        self.open.stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
-        self.open.fixed_buffer = true;
-        self.running = Some(self.open.run(engine, &self.stats)?);
-        Ok(())
+        Ok(engine)
     }
 }
 

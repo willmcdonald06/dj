@@ -7,6 +7,7 @@ mod deck_view;
 mod layout;
 mod mixer_view;
 mod painter;
+mod settings_view;
 mod theme;
 mod waves;
 
@@ -15,17 +16,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dj_analysis::Key as MusicalKey;
+use dj_analysis::KeyNotation;
 use dj_analysis::{TrackAnalysis, Transient};
 use dj_audio_io::{AudioOutput, BufferGrown, CallbackStats};
 use dj_engine::{
     ChannelControl, Command, DeckAction, DeckId, DeckSnapshot, EngineHandle, EngineSnapshot,
-    HOT_CUES, HotCue, MasterControl,
+    FxControl, HOT_CUES, HotCue, MasterControl, OutputMode, STEM_COUNT, Stem, TempoRange,
 };
 use dj_library::{AnalysisSource, CollectionKind, CueKind, Library, StoredCue};
+use dj_ui::WaveformStyle;
 
 use crate::browser::{Browser, Column, Filter, track_key};
 use crate::library_worker::{LibraryWorker, WorkerEvent, to_library, trusted_grid};
-use crate::settings::Settings;
+use crate::recorder::{self, RecordEvent, Recorder};
+use crate::settings::{BUFFER_CHOICES, Settings, tempo_range_percent};
 use dj_control::UiEvent;
 use dj_engine::BeatGrid;
 use dj_loader::{LoadEvent, Loader, TrackInfo};
@@ -38,6 +42,7 @@ use deck_view::{DeckView, KeyDisplay};
 use layout::{Area, Layout};
 use mixer_view::MixerView;
 use painter::Painter;
+use settings_view::{RowView, SettingRow, SettingsAction, SettingsView};
 
 const SEEK_SECONDS: f32 = 4.0;
 /// Tempo change per Up/Down press: 0.02%, a CDJ's finest step. Holding the key glides.
@@ -66,8 +71,6 @@ const REPEAT_DELAY: Duration = Duration::from_millis(400);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(35);
 /// Zoom factor per mouse-wheel notch over a waveform.
 const WHEEL_ZOOM: f64 = 1.15;
-/// Pitch bend per pixel of drag on a playing waveform.
-const WAVEFORM_BEND_PER_PIXEL: f32 = 0.004;
 /// Two presses on the same slider within this reset it.
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 /// Centred sliders snap to the centre within this fraction of their travel.
@@ -108,6 +111,10 @@ enum PadMode {
     HotCue,
     Roll,
     Jump,
+    /// Fixing the beatgrid by hand.
+    Grid,
+    /// Pads 1–4 mute and unmute the stems; 5–8 play one alone.
+    Stems,
 }
 
 /// A deck's pad mode, and whether the next hot cue pad press deletes.
@@ -155,10 +162,18 @@ pub struct Parts {
     /// Decks to start as soon as their first track is loaded (`--play`).
     pub play_on_load: [bool; 2],
     pub library: Option<Library>,
+    /// The settings in use (the file plus command-line overrides).
     pub settings: Settings,
+    /// The settings as saved in the file: the settings screen edits and saves these.
+    pub saved_settings: Settings,
+    pub settings_path: PathBuf,
+    /// `--channels`, kept when the settings screen reopens the device.
+    pub channels: Option<u16>,
     pub worker: Option<LibraryWorker>,
     /// Browsing and loading from the controller.
     pub controller_events: mpsc::Receiver<UiEvent>,
+    /// Records the main output; `None` if it couldn't start.
+    pub recorder: Option<Recorder>,
 }
 
 pub struct Frontend {
@@ -187,6 +202,15 @@ pub struct Frontend {
     /// Where hot cues are kept; `None` if it couldn't be opened.
     library: Option<Library>,
     settings: Settings,
+    saved_settings: Settings,
+    settings_path: PathBuf,
+    channels: Option<u16>,
+    /// The settings screen is open, with this row selected.
+    settings_open: Option<SettingRow>,
+    /// Output devices, read when the settings screen opens.
+    device_names: Vec<String>,
+    /// Why the last audio change didn't work, shown on that row of the settings screen.
+    audio_problem: Option<(SettingRow, String)>,
     worker: Option<LibraryWorker>,
     controller_events: mpsc::Receiver<UiEvent>,
     browser: Browser,
@@ -211,6 +235,7 @@ pub struct Frontend {
     pointer: (f32, f32),
     last_stats_log: Instant,
     last_xruns: u64,
+    recorder: Option<Recorder>,
 }
 
 impl Frontend {
@@ -222,8 +247,12 @@ impl Frontend {
             play_on_load,
             library,
             settings,
+            saved_settings,
+            settings_path,
+            channels,
             worker,
             controller_events,
+            recorder,
         } = parts;
         let mut frontend = Self {
             engine,
@@ -242,6 +271,12 @@ impl Frontend {
             last_slider_press: None,
             library,
             settings,
+            saved_settings,
+            settings_path,
+            channels,
+            settings_open: None,
+            device_names: Vec::new(),
+            audio_problem: None,
             worker,
             controller_events,
             browser: Browser::new(),
@@ -257,6 +292,7 @@ impl Frontend {
             pointer: (0.0, 0.0),
             last_stats_log: Instant::now(),
             last_xruns: 0,
+            recorder,
         };
         frontend.reload_browser();
         frontend
@@ -287,7 +323,12 @@ impl Frontend {
     /// Do what a button press asks.
     fn press(&mut self, action: UiAction) {
         match action {
-            UiAction::Deck(deck, action) => self.send(Command::deck(deck, action)),
+            UiAction::Deck(deck, action) => {
+                if let DeckAction::ToggleStem(_) | DeckAction::SoloStem(_) = action {
+                    self.explain_missing_stems(deck);
+                }
+                self.send(Command::deck(deck, action));
+            }
             UiAction::Cue(deck) => {
                 self.cue_held = Some(deck);
                 self.send(Command::deck(deck, DeckAction::CuePress));
@@ -317,6 +358,8 @@ impl Frontend {
                 pads.delete_armed = false;
             }
             UiAction::LoadSelected(deck) => self.load_selected(deck),
+            UiAction::Record => self.toggle_recording(),
+            UiAction::Settings(action) => self.settings_action(action),
             UiAction::Rescan => {
                 if let Some(worker) = &self.worker {
                     worker.rescan();
@@ -324,6 +367,8 @@ impl Frontend {
                 }
             }
             UiAction::Help => self.show_help = !self.show_help,
+            UiAction::Fx(control) => self.send(Command::Fx(control)),
+            UiAction::Grid(deck, edit) => self.edit_grid(deck, edit),
             UiAction::SplitCue => {
                 let on = !self.engine.snapshot().master.split_cue;
                 self.send(Command::Master(MasterControl::SplitCue(on)));
@@ -484,12 +529,10 @@ impl Frontend {
                 }
             }
             Control::Waveform(deck, frames_per_pixel) => {
-                let snapshot = self.engine.snapshot();
                 self.grab = Some(Grab::Waveform {
                     deck,
                     frames_per_pixel,
                     last_x: x,
-                    position: snapshot.deck(deck).position as f64,
                     moved: false,
                 });
             }
@@ -541,33 +584,26 @@ impl Frontend {
                 deck,
                 frames_per_pixel,
                 last_x,
-                position,
                 moved,
             }) => {
                 let dx = x - last_x;
                 if dx == 0.0 {
                     return;
                 }
-                let playing = self.engine.snapshot().deck(deck).transport.is_moving();
-                // Like grabbing the record: dragging left moves the track forward.
-                let position = match playing {
-                    true => {
-                        let amount = (-dx * WAVEFORM_BEND_PER_PIXEL).clamp(-0.3, 0.3);
-                        self.send(Command::deck(deck, DeckAction::Nudge { amount }));
-                        position
-                    }
-                    false => {
-                        let frame = (position - dx as f64 * frames_per_pixel).max(0.0);
-                        self.send(Command::deck(deck, DeckAction::JumpTo { frame }));
-                        frame
-                    }
-                };
+                // Like a hand on the record: the track moves with the pointer (left is
+                // forward), smoothly, at the speed it is dragged. The scratch starts
+                // with the first movement, so a click alone doesn't stop the track.
+                if !moved {
+                    self.send(Command::deck(deck, DeckAction::ScratchStart));
+                }
+                let rate = self.engine.snapshot().sample_rate as f64;
+                let seconds = (-dx as f64 * frames_per_pixel / rate) as f32;
+                self.send(Command::deck(deck, DeckAction::ScratchMove { seconds }));
                 self.grab = Some(Grab::Waveform {
                     deck,
                     frames_per_pixel,
                     last_x: x,
-                    position,
-                    moved: moved || dx.abs() > 0.0,
+                    moved: true,
                 });
             }
             _ => {}
@@ -610,9 +646,33 @@ impl Frontend {
             Some(Grab::Waveform {
                 deck, moved: false, ..
             }) => self.selected = deck,
+            Some(Grab::Waveform {
+                deck, moved: true, ..
+            }) => self.send(Command::deck(deck, DeckAction::ScratchEnd)),
             _ => {}
         }
         self.grab = None;
+    }
+
+    /// A stem button was pressed on a deck whose track has no stems: say why nothing
+    /// happens. (The mute still goes to the engine, for stems that are loading.)
+    fn explain_missing_stems(&mut self, deck: DeckId) {
+        let d = *self.engine.snapshot().deck(deck);
+        if d.track.is_none() || d.stems.available {
+            return;
+        }
+        let has_file = self.decks[deck.index()]
+            .path
+            .as_ref()
+            .is_some_and(|path| dj_loader::stems_path(path).is_file());
+        let message = match has_file {
+            true => format!("Deck {deck:?}'s stems are still loading (or failed to; see the log)."),
+            false => format!(
+                "No stems for deck {deck:?}'s track yet: run tools/analyze/analyze.py on its \
+                 folder (~2 min a track)."
+            ),
+        };
+        self.notify(message);
     }
 
     fn scrub(&mut self, deck: DeckId, area: Area, length: u64, x: f32) {
@@ -754,6 +814,47 @@ impl Frontend {
         cues
     }
 
+    /// Change a deck's beatgrid by hand, apply it at once and keep it in the library
+    /// (where it beats the analysis from then on).
+    fn edit_grid(&mut self, deck: DeckId, edit: GridEdit) {
+        let state = self.engine.snapshot();
+        let rate = state.sample_rate;
+        let d = *state.deck(deck);
+        let (Some(track), Some(analysis)) = (d.track, self.info(deck, &d).1) else {
+            self.notify("Load a track and let it analyse first.".to_string());
+            return;
+        };
+        let path = self.decks[deck.index()].path.clone();
+        let stored = path
+            .as_ref()
+            .and_then(|path| self.library.as_ref()?.track(path).ok().flatten());
+        let sidecar = stored
+            .as_ref()
+            .filter(|t| t.analysis_source == Some(AnalysisSource::Sidecar));
+        let analysed = analysed_grid(analysis, sidecar, rate);
+        // With no grid yet, start from the analysis's estimate, sure or not.
+        let current = d.grid.or(analysed).or(analysis.grid.map(|g| g.grid));
+        let grid = match (edit, current) {
+            (GridEdit::Reset, _) => analysed,
+            (_, Some(grid)) => Some(edited_grid(grid, edit, d.position as f64, rate)),
+            (_, None) => {
+                self.notify("This track has no beatgrid to adjust.".to_string());
+                return;
+            }
+        };
+        self.send(Command::deck(deck, DeckAction::SetBeatGrid { track, grid }));
+        let saved = match edit {
+            GridEdit::Reset => None,
+            _ => grid.map(|g| (g.bpm(rate), g.anchor / f64::from(rate))),
+        };
+        if let (Some(library), Some(path)) = (self.library.as_mut(), &path) {
+            match library.set_user_grid(path, saved) {
+                Ok(()) => self.browser_dirty = true,
+                Err(err) => tracing::warn!("saving the beatgrid: {err}"),
+            }
+        }
+    }
+
     /// Save any hot cue changes to the library straight away.
     fn persist_cues(&mut self, state: &EngineSnapshot) {
         let rate = state.sample_rate as f64;
@@ -847,6 +948,277 @@ impl Frontend {
     }
 
     /// Library worker news and controller browsing.
+    fn settings_action(&mut self, action: SettingsAction) {
+        match action {
+            SettingsAction::Open => {
+                self.settings_open = Some(SettingRow::Device);
+                self.show_help = false;
+                self.browser_focus = false;
+                self.device_names = list_devices();
+            }
+            SettingsAction::Close => self.settings_open = None,
+            SettingsAction::Select(row) => self.settings_open = Some(row),
+            SettingsAction::Step(row, by) => {
+                self.settings_open = Some(row);
+                self.step_setting(row, by);
+            }
+            SettingsAction::Nothing => {}
+        }
+    }
+
+    /// Keys while the settings screen is open: it takes them all.
+    fn settings_key(&mut self, key: Key) {
+        let Some(row) = self.settings_open else {
+            return;
+        };
+        match key {
+            Key::Escape => self.settings_open = None,
+            Key::Up => self.settings_open = Some(row.moved(-1)),
+            Key::Down | Key::Tab => self.settings_open = Some(row.moved(1)),
+            Key::Left => self.step_setting(row, -1),
+            Key::Right | Key::Enter | Key::Space => self.step_setting(row, 1),
+            _ => {}
+        }
+    }
+
+    /// Change one setting to its previous or next value, apply it and save it.
+    fn step_setting(&mut self, row: SettingRow, by: i32) {
+        let s = &self.settings;
+        match row {
+            SettingRow::Device => {
+                let mut choices: Vec<Option<String>> = vec![None];
+                choices.extend(self.device_names.iter().cloned().map(Some));
+                // A name typed by hand (or a device that's unplugged) stays choosable.
+                if !choices.contains(&s.audio_device) {
+                    choices.insert(1, s.audio_device.clone());
+                }
+                let device = step(&choices, &s.audio_device, by);
+                self.change_audio(row, |s| s.audio_device = device.clone());
+            }
+            SettingRow::Buffer => {
+                let mut choices: Vec<Option<u32>> = vec![None];
+                choices.extend(BUFFER_CHOICES.map(Some));
+                if !choices.contains(&s.buffer_frames) {
+                    choices.push(s.buffer_frames);
+                    choices.sort();
+                }
+                let frames = step(&choices, &s.buffer_frames, by);
+                self.change_audio(row, |s| s.buffer_frames = frames);
+            }
+            SettingRow::Output => {
+                let modes = [OutputMode::InternalMix, OutputMode::PerDeck];
+                let mode = step(&modes, &s.output_mode, by);
+                self.change_audio(row, |s| s.output_mode = mode);
+            }
+            SettingRow::TempoRange => {
+                let ranges = [
+                    TempoRange::Percent8,
+                    TempoRange::Percent16,
+                    TempoRange::Percent50,
+                ];
+                let range = step(&ranges, &s.tempo_range, by);
+                self.change_settings(|s| s.tempo_range = range);
+                for deck in DeckId::ALL {
+                    self.send(Command::deck(deck, DeckAction::SetTempoRange(range)));
+                }
+            }
+            SettingRow::KeyLock => {
+                let on = !s.key_lock;
+                self.change_settings(|s| s.key_lock = on);
+                for deck in DeckId::ALL {
+                    self.send(Command::deck(deck, DeckAction::SetKeyLock(on)));
+                }
+            }
+            SettingRow::KeyNotation => {
+                let notations = [
+                    KeyNotation::OpenKey,
+                    KeyNotation::Camelot,
+                    KeyNotation::Musical,
+                ];
+                let notation = step(&notations, &s.key_notation, by);
+                self.change_settings(|s| s.key_notation = notation);
+            }
+            SettingRow::Waveform => {
+                let styles = [WaveformStyle::Spectrum, WaveformStyle::ThreeBand];
+                let style = step(&styles, &s.waveform, by);
+                self.change_settings(|s| s.waveform = style);
+            }
+        }
+    }
+
+    /// Apply `edit` to the settings in use and to the saved ones, and save.
+    fn change_settings(&mut self, edit: impl Fn(&mut Settings)) {
+        edit(&mut self.settings);
+        edit(&mut self.saved_settings);
+        if let Err(err) = self.saved_settings.save(&self.settings_path) {
+            tracing::error!("can't save {}: {err}", self.settings_path.display());
+            self.notify(format!(
+                "Couldn't save the settings to {}: {err}",
+                self.settings_path.display()
+            ));
+        }
+    }
+
+    /// Change an audio setting: reopen the output with it, and keep it only if that
+    /// works.
+    fn change_audio(&mut self, row: SettingRow, edit: impl Fn(&mut Settings)) {
+        let mut wanted = self.settings.clone();
+        edit(&mut wanted);
+        if wanted == self.settings {
+            return;
+        }
+        match self
+            .audio
+            .reconfigure(&wanted.audio(self.channels), wanted.output_mode)
+        {
+            Ok(()) => {
+                self.audio_problem = None;
+                self.change_settings(edit);
+            }
+            Err(err) => {
+                tracing::warn!("audio change refused: {err}");
+                self.audio_problem = Some((row, capitalise(&err.to_string())));
+                self.notify(format!("Kept the old audio setup: {err}"));
+            }
+        }
+    }
+
+    /// What the settings screen shows.
+    fn setting_rows(&self) -> Vec<RowView> {
+        let s = &self.settings;
+        let rate = self.audio.sample_rate() as f64;
+        let channels = self.audio.channels();
+        let actual_buffer = self.audio.buffer_frames();
+        let ms = |frames: u32| frames as f64 / rate * 1000.0;
+        SettingRow::ALL
+            .into_iter()
+            .map(|row| {
+                let mut warn = false;
+                let (value, detail) = match row {
+                    SettingRow::Device => {
+                        let value = s
+                            .audio_device
+                            .clone()
+                            .unwrap_or_else(|| "System default".to_string());
+                        let detail = format!(
+                            "Using {} — {} outputs at {} Hz",
+                            self.audio.device_name(),
+                            channels,
+                            self.audio.sample_rate()
+                        );
+                        (value, detail)
+                    }
+                    SettingRow::Buffer => {
+                        let value = match s.buffer_frames {
+                            Some(frames) => format!("{frames} frames · {:.1} ms", ms(frames)),
+                            None => "Device default".to_string(),
+                        };
+                        let detail = match (s.buffer_frames, actual_buffer) {
+                            (Some(want), Some(got)) if got != want => {
+                                warn = true;
+                                format!(
+                                    "Running at {got} frames ({:.1} ms) after dropouts",
+                                    ms(got)
+                                )
+                            }
+                            (None, Some(got)) => format!("Running at {got} frames"),
+                            _ => "Smaller is tighter; bigger if the audio crackles".to_string(),
+                        };
+                        (value, detail)
+                    }
+                    SettingRow::Output => match s.output_mode {
+                        OutputMode::InternalMix => (
+                            "Internal mix".to_string(),
+                            match channels {
+                                0..=3 => "Main on 1–2; no headphone outputs on this device",
+                                _ => "Main on 1–2, headphones on 3–4",
+                            }
+                            .to_string(),
+                        ),
+                        OutputMode::PerDeck => (
+                            "Per deck (external mixer)".to_string(),
+                            "Deck A on 1–2, deck B on 3–4; EQ, faders and filter bypassed"
+                                .to_string(),
+                        ),
+                    },
+                    SettingRow::TempoRange => (
+                        format!("±{}%", tempo_range_percent(s.tempo_range)),
+                        "Both decks now, and at start; R changes one deck".to_string(),
+                    ),
+                    SettingRow::KeyLock => (
+                        match s.key_lock {
+                            true => "On",
+                            false => "Off",
+                        }
+                        .to_string(),
+                        "Both decks now, and at start; K changes one deck".to_string(),
+                    ),
+                    SettingRow::KeyNotation => (
+                        match s.key_notation {
+                            KeyNotation::OpenKey => "Open Key (8m)",
+                            KeyNotation::Camelot => "Camelot (8A)",
+                            KeyNotation::Musical => "Musical (Am)",
+                        }
+                        .to_string(),
+                        "How keys are written on the decks and in the browser".to_string(),
+                    ),
+                    SettingRow::Waveform => (
+                        match s.waveform {
+                            WaveformStyle::Spectrum => "Spectrum",
+                            WaveformStyle::ThreeBand => "Three bands",
+                        }
+                        .to_string(),
+                        match s.waveform {
+                            WaveformStyle::Spectrum => "Red bass, green mids, blue highs",
+                            WaveformStyle::ThreeBand => "Low, mid and high bands layered",
+                        }
+                        .to_string(),
+                    ),
+                };
+                let (detail, warn) = match &self.audio_problem {
+                    Some((problem_row, problem)) if *problem_row == row => (problem.clone(), true),
+                    _ => (detail, warn),
+                };
+                RowView {
+                    row,
+                    value,
+                    detail,
+                    warn,
+                }
+            })
+            .collect()
+    }
+
+    fn toggle_recording(&mut self) {
+        match &mut self.recorder {
+            Some(recorder) => recorder.toggle(),
+            None => self.notify(
+                "Recording isn't available: the recorder didn't start (see the log).".to_string(),
+            ),
+        }
+    }
+
+    /// The REC button's state: `None` when stopped, else the elapsed seconds.
+    fn recording_state(&self) -> Option<f64> {
+        let recorder = self.recorder.as_ref()?;
+        match recorder.is_recording() {
+            true => Some(recorder.elapsed_seconds()),
+            false => None,
+        }
+    }
+
+    fn poll_recorder(&mut self) {
+        let mut messages = Vec::new();
+        if let Some(recorder) = &mut self.recorder {
+            while let Some(event) = recorder.try_event() {
+                messages.push(recording_message(&event));
+            }
+        }
+        for message in messages {
+            self.notify(message);
+        }
+    }
+
     fn poll_library(&mut self) {
         if let Some(worker) = &self.worker {
             while let Some(event) = worker.try_event() {
@@ -1086,7 +1458,9 @@ impl Frontend {
                 LoadEvent::Analyzed {
                     deck, id, analysis, ..
                 } => {
-                    // A sidecar's grid and key (offline analyzer) beat the app's own.
+                    // The app's grid sits on the attacks, consistently across tracks;
+                    // a sidecar's (offline analyzer) is the fallback when the app isn't
+                    // sure. A sidecar's key beats the app's.
                     let rate = self.engine.snapshot().sample_rate;
                     let stored = self.decks[deck.index()]
                         .path
@@ -1095,12 +1469,16 @@ impl Frontend {
                     let sidecar = stored
                         .as_ref()
                         .filter(|t| t.analysis_source == Some(AnalysisSource::Sidecar));
-                    let grid = match sidecar {
-                        Some(track) => track.analysis.bpm.map(|bpm| {
-                            let anchor = track.analysis.grid_anchor.unwrap_or(0.0);
-                            BeatGrid::from_bpm(bpm, anchor * rate as f64, rate)
-                        }),
-                        None => trusted_grid(&analysis),
+                    // A grid set by hand beats both.
+                    let user = self.decks[deck.index()]
+                        .path
+                        .as_ref()
+                        .and_then(|path| self.library.as_ref()?.user_grid(path).ok().flatten());
+                    let grid = match user {
+                        Some((bpm, anchor)) => {
+                            Some(BeatGrid::from_bpm(bpm, anchor * rate as f64, rate))
+                        }
+                        None => analysed_grid(&analysis, sidecar, rate),
                     };
                     let sidecar_key = sidecar.and_then(track_key);
                     // Keep the library up to date with what the app found.
@@ -1145,7 +1523,10 @@ impl Frontend {
                     let name = file_name(&path);
                     self.notify(format!("Couldn't load {name} onto deck {deck:?}: {error}"));
                 }
-                LoadEvent::Finished { .. } => {}
+                LoadEvent::StemsFailed { deck, error, .. } => {
+                    self.notify(format!("Deck {deck:?} stems: {error}"));
+                }
+                LoadEvent::Finished { .. } | LoadEvent::StemsLoaded { .. } => {}
             }
         }
     }
@@ -1189,6 +1570,7 @@ impl Delegate for Frontend {
             Input::PointerUp { .. } => self.pointer_up(),
             Input::Scroll { x, y, lines } => self.scroll(x, y, lines),
             Input::KeyDown { repeat: false, .. } if self.show_help => self.show_help = false,
+            Input::KeyDown { key, .. } if self.settings_open.is_some() => self.settings_key(key),
             Input::KeyDown { key, repeat }
                 if self.browser_wants_keys() && self.browser_key(key, repeat) => {}
             Input::KeyDown { key, repeat } => match key {
@@ -1232,15 +1614,33 @@ impl Delegate for Frontend {
                 }
                 Key::Char('e') if !repeat => self.deck_action(DeckAction::Eject),
                 Key::Char('t') if !repeat => self.send(Command::ToggleTone),
+                Key::Char('w') if !repeat => self.toggle_recording(),
+                Key::Char('u') if !repeat => self.settings_action(SettingsAction::Open),
                 Key::Char(c @ '1'..='8') if !repeat => {
                     let slot = c as usize - '1' as usize;
-                    self.press(UiAction::HotCue(self.selected, slot));
+                    match self.decks[self.selected.index()].pads.mode {
+                        PadMode::Stems => self.press(stem_pad(self.selected, slot)),
+                        _ => self.press(UiAction::HotCue(self.selected, slot)),
+                    }
+                }
+                Key::Char('m') if !repeat => {
+                    let pads = &mut self.decks[self.selected.index()].pads;
+                    pads.mode = match pads.mode {
+                        PadMode::Stems => PadMode::HotCue,
+                        _ => PadMode::Stems,
+                    };
+                    pads.delete_armed = false;
                 }
                 Key::Char('i') if !repeat => self.deck_action(DeckAction::LoopIn),
                 Key::Char('o') if !repeat => self.deck_action(DeckAction::LoopOut),
                 Key::Char('l') if !repeat => self.deck_action(DeckAction::AutoLoop { beats: 4.0 }),
                 Key::Char('[') => self.deck_action(DeckAction::LoopHalve),
                 Key::Char(']') => self.deck_action(DeckAction::LoopDouble),
+                Key::Char('f') if !repeat => self.send(Command::Fx(FxControl::ToggleOn)),
+                Key::Char('g') if !repeat => self.send(Command::Fx(FxControl::StepKind(1))),
+                Key::Char('z') => self.send(Command::Fx(FxControl::StepBeats(-1))),
+                Key::Char('x') => self.send(Command::Fx(FxControl::StepBeats(1))),
+                Key::Char('v') if !repeat => self.send(Command::Fx(FxControl::Tap)),
                 Key::Char('=') | Key::Char('+') => self.zoom(1.0 / 1.25),
                 Key::Char('-') => self.zoom(1.25),
                 _ => {}
@@ -1278,6 +1678,7 @@ impl Delegate for Frontend {
         }
         self.poll_loader();
         self.poll_library();
+        self.poll_recorder();
         self.maybe_log_stats();
         let state = self.engine.snapshot();
         self.persist_cues(&state);
@@ -1329,6 +1730,8 @@ impl Delegate for Frontend {
                 stats: &stats,
                 help: self.show_help,
                 phase_ms,
+                fx: state.fx,
+                recording: self.recording_state(),
             },
         );
         let look = waves::WaveLook {
@@ -1443,8 +1846,81 @@ impl Delegate for Frontend {
         if self.show_help {
             painter.help(&layout);
         }
+        if let Some(selected) = self.settings_open {
+            let rows = self.setting_rows();
+            let path = tilde(&self.settings_path);
+            painter.settings(
+                &layout,
+                SettingsView {
+                    rows: &rows,
+                    selected,
+                    path: &path,
+                },
+            );
+        }
         self.hits = painter.hits;
         painter.scene
+    }
+}
+
+/// The grid from analysis: the app's own if it is sure of it, else a sidecar's.
+fn analysed_grid(
+    analysis: &TrackAnalysis,
+    sidecar: Option<&dj_library::Track>,
+    rate: u32,
+) -> Option<BeatGrid> {
+    trusted_grid(analysis).or_else(|| {
+        let track = sidecar?;
+        let bpm = track.analysis.bpm?;
+        let anchor = track.analysis.grid_anchor.unwrap_or(0.0);
+        Some(BeatGrid::from_bpm(bpm, anchor * rate as f64, rate))
+    })
+}
+
+/// A change to a deck's beatgrid by hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GridEdit {
+    /// The beat nearest the playhead starts a bar.
+    DownbeatHere,
+    /// Bars start one beat later.
+    NextBeat,
+    /// The grid moves by half a beat.
+    HalfBeat,
+    /// The grid moves by this many milliseconds (later is positive).
+    Nudge(f64),
+    /// The tempo is multiplied by this (2 or 0.5), keeping the grid at the playhead.
+    Scale(f64),
+    /// Back to the analysis's grid.
+    Reset,
+}
+
+/// `grid` changed by `edit`, with the playhead at `position` (frames).
+fn edited_grid(grid: BeatGrid, edit: GridEdit, position: f64, rate: u32) -> BeatGrid {
+    let BeatGrid { anchor, period } = grid;
+    let nearest_beat = |at: f64| anchor + ((at - anchor) / period).round() * period;
+    match edit {
+        GridEdit::DownbeatHere => BeatGrid {
+            anchor: nearest_beat(position),
+            period,
+        },
+        GridEdit::NextBeat => BeatGrid {
+            anchor: anchor + period,
+            period,
+        },
+        GridEdit::HalfBeat => BeatGrid {
+            anchor: anchor + period / 2.0,
+            period,
+        },
+        GridEdit::Nudge(ms) => BeatGrid {
+            anchor: anchor + ms / 1000.0 * f64::from(rate),
+            period,
+        },
+        // Keep the beat nearest the playhead where it is.
+        GridEdit::Scale(factor) => BeatGrid {
+            anchor: nearest_beat(position),
+            period: period / factor,
+        },
+        GridEdit::Reset => grid,
     }
 }
 
@@ -1498,12 +1974,17 @@ enum UiAction {
     Roll(DeckId, f32),
     PadMode(DeckId, PadMode),
     DeleteArm(DeckId),
+    /// Fix the beatgrid by hand.
+    Grid(DeckId, GridEdit),
     /// Multiply the auto-loop length (and the active loop) by this.
     LoopSize(DeckId, f32),
     /// Start a loop of the chosen length, or leave the active one.
     AutoLoop(DeckId),
     LoadSelected(DeckId),
     Rescan,
+    /// Start or stop recording the main output.
+    Record,
+    Settings(SettingsAction),
     Help,
     NewCollection(CollectionKind),
     RenameCollection,
@@ -1511,13 +1992,114 @@ enum UiAction {
     DeleteCollection,
     RemoveFromCollection,
     MoveInPlaylist(i32),
+    /// A beat FX button.
+    Fx(FxControl),
+}
+
+/// The value `by` steps from `current` in `choices`, wrapping around; the first choice
+/// if `current` isn't one of them.
+fn step<T: Clone + PartialEq>(choices: &[T], current: &T, by: i32) -> T {
+    let n = choices.len() as i32;
+    let next = match choices.iter().position(|c| c == current) {
+        Some(i) => (i as i32 + by).rem_euclid(n),
+        None => 0,
+    };
+    choices[next as usize].clone()
+}
+
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// `path` with the home folder written as `~`.
+fn tilde(path: &std::path::Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.and_then(|home| path.strip_prefix(home).ok().map(PathBuf::from)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Output device names, without repeats.
+fn list_devices() -> Vec<String> {
+    let names = match dj_audio_io::output_device_names() {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::warn!("can't list output devices: {err}");
+            return Vec::new();
+        }
+    };
+    let mut seen = Vec::new();
+    for name in names {
+        let name = name.trim().trim_end_matches(',').to_string();
+        // ALSA's null device ("Discard all samples …") is never what anyone wants.
+        let null = name.starts_with("Discard all samples");
+        if !name.is_empty() && !null && !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    seen
+}
+
+/// What to tell the user about a recorder event.
+fn recording_message(event: &RecordEvent) -> String {
+    let name = |path: &std::path::Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    match event {
+        RecordEvent::Started { path } => format!("Recording to {}", path.display()),
+        RecordEvent::Stopped {
+            files,
+            seconds,
+            dropped_seconds,
+        } => {
+            let mut message = format!("Recorded {} to ", recorder::clock(*seconds));
+            match files.as_slice() {
+                [one] => message.push_str(&name(one)),
+                [first, ..] => {
+                    message.push_str(&format!("{} and {} more", name(first), files.len() - 1))
+                }
+                [] => message.push_str("nothing"),
+            }
+            if *dropped_seconds > 0.0 {
+                message.push_str(&format!(
+                    " ({dropped_seconds:.1} s lost: the disk couldn't keep up, filled with silence)"
+                ));
+            }
+            message
+        }
+        RecordEvent::Failed { error } => format!("Recording failed: {error}"),
+        RecordEvent::Recovered { files } => match files.as_slice() {
+            [one] => format!("Recovered an unfinished recording: {}", name(one)),
+            _ => format!("Recovered {} unfinished recordings", files.len()),
+        },
+    }
+}
+
+/// What stem pad `pad` (0–7) does: 1–4 toggle a stem, 5–8 solo one.
+fn stem_pad(deck: DeckId, pad: usize) -> UiAction {
+    let action = match pad < STEM_COUNT {
+        true => DeckAction::ToggleStem(Stem::ALL[pad]),
+        false => DeckAction::SoloStem(Stem::ALL[(pad - STEM_COUNT) % STEM_COUNT]),
+    };
+    UiAction::Deck(deck, action)
 }
 
 impl UiAction {
     fn repeats(self) -> bool {
         matches!(
             self,
-            UiAction::Tempo(..) | UiAction::Nudge(..) | UiAction::Zoom(_)
+            UiAction::Tempo(..)
+                | UiAction::Nudge(..)
+                | UiAction::Zoom(_)
+                | UiAction::Grid(_, GridEdit::Nudge(_))
+                | UiAction::Fx(FxControl::StepBeats(_))
         )
     }
 }
@@ -1534,6 +2116,8 @@ enum Slider {
     Main,
     Phones,
     CueMix,
+    /// The beat FX level.
+    FxLevel,
 }
 
 impl Slider {
@@ -1556,6 +2140,7 @@ impl Slider {
             Slider::Main => state.master.main_level,
             Slider::Phones => state.master.phones_level,
             Slider::CueMix => state.master.cue_mix,
+            Slider::FxLevel => state.fx.level,
         }
     }
 
@@ -1574,6 +2159,7 @@ impl Slider {
             Slider::Main => Command::Master(MasterControl::MainLevel(unit)),
             Slider::Phones => Command::Master(MasterControl::PhonesLevel(unit)),
             Slider::CueMix => Command::Master(MasterControl::CueMix(unit)),
+            Slider::FxLevel => Command::Fx(FxControl::SetLevel(unit)),
         }
     }
 
@@ -1583,6 +2169,7 @@ impl Slider {
         match self {
             _ if self.centred() => 0.5,
             Slider::CueMix => 0.0,
+            Slider::FxLevel => 0.5,
             _ => 1.0,
         }
     }
@@ -1660,8 +2247,7 @@ enum Grab {
         deck: DeckId,
         frames_per_pixel: f64,
         last_x: f32,
-        /// Where the dragged (paused) playhead is, ahead of the engine's snapshot.
-        position: f64,
+        /// Dragged (and so scratching) rather than just clicked.
         moved: bool,
     },
 }
@@ -1690,6 +2276,39 @@ mod tests {
     use super::*;
     use dj_analysis::analyze_frames;
     use dj_engine::TrackId;
+
+    #[test]
+    fn grid_edits() {
+        let rate = 48_000;
+        let grid = BeatGrid {
+            anchor: 1000.0,
+            period: 24_000.0,
+        };
+        // Playhead just after beat 5.
+        let here = edited_grid(
+            grid,
+            GridEdit::DownbeatHere,
+            1000.0 + 5.0 * 24_000.0 + 300.0,
+            rate,
+        );
+        assert_eq!(here.anchor, 121_000.0);
+        assert_eq!(
+            edited_grid(grid, GridEdit::NextBeat, 0.0, rate).anchor,
+            25_000.0
+        );
+        assert_eq!(
+            edited_grid(grid, GridEdit::HalfBeat, 0.0, rate).anchor,
+            13_000.0
+        );
+        assert_eq!(
+            edited_grid(grid, GridEdit::Nudge(-2.0), 0.0, rate).anchor,
+            904.0
+        );
+        let double = edited_grid(grid, GridEdit::Scale(2.0), 49_500.0, rate);
+        assert_eq!(double.period, 12_000.0);
+        // The beat at the playhead (beat 2, frame 49 000) stays put.
+        assert_eq!(double.anchor, 49_000.0);
+    }
 
     #[test]
     fn slider_commands_round_trip_through_the_snapshot() {

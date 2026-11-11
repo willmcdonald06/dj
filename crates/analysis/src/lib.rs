@@ -8,6 +8,7 @@
 pub mod beatgrid;
 pub mod key;
 pub mod onsets;
+pub mod tempo;
 pub mod transients;
 pub mod waveform;
 
@@ -22,7 +23,7 @@ use std::sync::Arc;
 use dj_engine::Track;
 
 /// Bumped whenever an analyser changes its output, so stored results can be redone.
-pub const ANALYSIS_VERSION: u32 = 3;
+pub const ANALYSIS_VERSION: u32 = 4;
 
 /// Level (peak, linear) that counts as the track's first sound: -40 dB.
 pub const FIRST_SOUND_LEVEL: f32 = 0.01;
@@ -124,19 +125,22 @@ pub fn analyze_frames(
     let mut waveform = WaveformBuilder::new(sample_rate, expected_frames);
     let mut kicks = KickDetector::new(sample_rate, expected_frames);
     let mut key = KeyDetector::new(sample_rate);
+    let mut onsets = tempo::OnsetAnalyser::new(sample_rate, expected_frames);
     for (left, right) in frames {
         waveform.push(left, right);
         kicks.push(left, right);
         key.push(left, right);
+        onsets.push(left, right);
     }
     let waveform = waveform.finish();
     let kicks = kicks.finish();
+    let onsets = onsets.finish();
     TrackAnalysis {
         version: ANALYSIS_VERSION,
         sample_rate,
         frames: waveform.frames,
         waveform: Arc::new(waveform),
-        grid: beatgrid::estimate(&kicks, sample_rate),
+        grid: tempo::estimate(&onsets, &kicks, sample_rate),
         key: key.finish(),
         kicks,
     }
